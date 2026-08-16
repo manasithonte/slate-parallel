@@ -3,3 +3,52 @@
 venv/
 __pycache__/
 *.pyc
+gcp-key.json
+
+# --- Environment & API Secrets (CRITICAL) ---
+.env
+.env.*
+*.env
+gcp-key.json
+service-account*.json
+credentials.json
+
+# --- Python Virtual Environment ---
+venv/
+env/
+ENV/
+.venv/
+env.bak/
+venv.bak/
+
+# --- Byte-compiled / Cache files ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Generated Local Media Outputs & Temporary Files ---
+outputs/
+*.mp4
+*.wav
+*.mp3
+*.srt
+*.vtt
+
+# --- macOS / OS Metadata ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# --- Editor Configurations ---
+.vscode/
+.idea/
+*.swp
+*.swo

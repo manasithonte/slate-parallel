@@ -1,0 +1,8 @@
+venv/
+.env
+gcp-key.json
+outputs/
+__pycache__/
+*.pyc
+.git
+.gitignore
