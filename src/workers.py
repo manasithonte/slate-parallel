@@ -4,10 +4,14 @@ import asyncio
 import time
 import tempfile
 import urllib.request
-from typing import List
+from typing import Dict, List
 from dotenv import load_dotenv
 from src.schemas import DepartmentOutput
-from src.media_engine import generate_crop_ffmpeg_command, generate_srt_file
+from src.media_engine import (
+    generate_crop_ffmpeg_command,
+    generate_dubbed_audio_file,
+    generate_srt_file,
+)
 
 load_dotenv()
 
@@ -168,12 +172,25 @@ async def run_script_subtitle_worker(
 async def script_and_subtitle_worker(script_text: str, languages: List[str]) -> DepartmentOutput:
     return await run_script_subtitle_worker("", script_text, languages, "Untitled Project")
 
-async def sound_stage_dubbing_worker(script_text: str, languages: List[str]) -> DepartmentOutput:
-    """Worker 2: Sound Stage & Dubbing Lead."""
+async def sound_stage_dubbing_worker(
+    title: str, localized_dialogues: Dict[str, str]
+) -> DepartmentOutput:
+    """Worker 2: Generate downloadable localized MP3 dubbed-audio tracks."""
     start_time = time.time()
-    await asyncio.sleep(0.5)
-    
-    audio_tracks = {lang: f"outputs/dubbed_track_{lang.lower()}.wav" for lang in languages}
+    audio_tracks = {}
+    audio_errors = {}
+
+    for language, dialogue in localized_dialogues.items():
+        if not dialogue:
+            audio_errors[language] = "No localized dialogue was available for synthesis."
+            continue
+        try:
+            audio_tracks[language] = await asyncio.to_thread(
+                generate_dubbed_audio_file, title, language, dialogue
+            )
+        except Exception as exc:
+            print(f"[Worker 02 Dubbing Fallback ({language})]: {exc}")
+            audio_errors[language] = str(exc)
     
     return DepartmentOutput(
         worker_id="worker_02",
@@ -181,7 +198,8 @@ async def sound_stage_dubbing_worker(script_text: str, languages: List[str]) -> 
         status="SUCCESS",
         data={
             "dubbed_tracks": audio_tracks,
-            "voice_profile": "Multi-speaker pitch matching applied"
+            "audio_errors": audio_errors,
+            "voice_profile": "Cloud Text-to-Speech MP3, 1.05x rate, -0.95 pitch",
         },
         execution_time_seconds=round(time.time() - start_time, 2)
     )

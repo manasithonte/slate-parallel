@@ -2,10 +2,51 @@
 import os
 import re
 
+try:
+    from google.cloud import texttospeech
+except ImportError:
+    texttospeech = None
+
 OUTPUT_DIR = "outputs"
 os.makedirs(os.path.join(OUTPUT_DIR, "subtitles"), exist_ok=True)
 os.makedirs(os.path.join(OUTPUT_DIR, "audio"), exist_ok=True)
 os.makedirs(os.path.join(OUTPUT_DIR, "compliance"), exist_ok=True)
+
+LANGUAGE_CODES = {
+    "Japanese": "ja-JP",
+    "Spanish": "es-ES",
+    "French": "fr-FR",
+    "German": "de-DE",
+    "Hindi": "hi-IN",
+}
+
+
+def generate_dubbed_audio_file(title: str, language: str, text: str) -> str:
+    """Synthesize a localized MP3 with Google Cloud Text-to-Speech."""
+    if not texttospeech:
+        raise RuntimeError("Google Cloud Text-to-Speech SDK is not installed")
+    if not text.strip():
+        raise ValueError("Cannot synthesize an empty dubbed-audio track")
+
+    safe_title = re.sub(r"[^a-zA-Z0-9_]", "_", title.lower())
+    filename = f"{safe_title}_{language.lower()}_dub.mp3"
+    filepath = os.path.join(OUTPUT_DIR, "audio", filename)
+    client = texttospeech.TextToSpeechClient()
+    response = client.synthesize_speech(
+        input=texttospeech.SynthesisInput(text=text),
+        voice=texttospeech.VoiceSelectionParams(
+            language_code=LANGUAGE_CODES.get(language, "en-US"),
+            ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL,
+        ),
+        audio_config=texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=1.05,
+            pitch=-0.95,
+        ),
+    )
+    with open(filepath, "wb") as audio_file:
+        audio_file.write(response.audio_content)
+    return filepath
 
 def generate_srt_file(title: str, language: str, text: str) -> str:
     """Writes a standardized .srt subtitle track file."""

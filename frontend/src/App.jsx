@@ -46,6 +46,9 @@ export default function App() {
   const workerOneData = pipelineData?.master_release_package?.raw_department_data?.find(
     worker => worker.worker_id === "worker_01"
   )?.data;
+  const workerTwoData = pipelineData?.master_release_package?.raw_department_data?.find(
+    worker => worker.worker_id === "worker_02"
+  )?.data;
 
   const [workerStates, setWorkerStates] = useState({
     worker_01: { status: 'IDLE', time: null, data: null },
@@ -386,7 +389,11 @@ export default function App() {
                   </p>
                 </div>
 
-                {selectedLanguages.map(lang => (
+                {selectedLanguages.map(lang => {
+                  const dubbedTrackPath = workerTwoData?.dubbed_tracks?.[lang];
+                  const downloadedFilename = dubbedTrackPath?.split("/").pop();
+
+                  return (
                   <div key={lang} className="flex flex-col sm:flex-row items-center justify-between gap-3 p-3 bg-slate-900/90 rounded-lg border border-slate-800">
                     <div className="w-full sm:w-auto">
                       <div className="flex items-center gap-2">
@@ -402,29 +409,44 @@ export default function App() {
                       </p>
                     </div>
 
-                    <button
-                      onClick={() => playLocalizedVoice(lang)}
-                      disabled={!workerOneData?.localized_dialogues?.[lang]}
-                      className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition ${
-                        playingAudio === lang
-                          ? 'bg-rose-600 text-white animate-pulse shadow-lg shadow-rose-600/30'
-                          : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/30'
-                      } disabled:cursor-not-allowed disabled:opacity-50`}
-                    >
-                      {playingAudio === lang ? (
-                        <>
-                          <VolumeX className="w-4 h-4" />
-                          <span>Stop Dub</span>
-                        </>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => playLocalizedVoice(lang)}
+                        disabled={!workerOneData?.localized_dialogues?.[lang]}
+                        className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition ${
+                          playingAudio === lang
+                            ? 'bg-rose-600 text-white animate-pulse shadow-lg shadow-rose-600/30'
+                            : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/30'
+                        } disabled:cursor-not-allowed disabled:opacity-50`}
+                      >
+                        {playingAudio === lang ? (
+                          <>
+                            <VolumeX className="w-4 h-4" />
+                            <span>Stop Dub</span>
+                          </>
+                        ) : (
+                          <>
+                            <Volume2 className="w-4 h-4" />
+                            <span>Listen Dub</span>
+                          </>
+                        )}
+                      </button>
+                      {downloadedFilename ? (
+                        <a
+                          href={`${API_BASE_URL}/api/v1/downloads/audio/${encodeURIComponent(downloadedFilename)}`}
+                          download={downloadedFilename}
+                          className="flex items-center gap-2 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-xs font-semibold text-white transition shadow-lg shadow-emerald-600/20"
+                        >
+                          <Download className="w-4 h-4" />
+                          <span>Download MP3</span>
+                        </a>
                       ) : (
-                        <>
-                          <Volume2 className="w-4 h-4" />
-                          <span>Listen Dub</span>
-                        </>
+                        <span className="text-[10px] text-slate-500">MP3 unavailable</span>
                       )}
-                    </button>
+                    </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
 
               {/* 2. Visual Social Video Crop Section */}
