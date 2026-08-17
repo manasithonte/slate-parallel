@@ -2,38 +2,171 @@
 import os
 import asyncio
 import time
+import tempfile
+import urllib.request
 from typing import List
-from parallel import AsyncParallel
+from dotenv import load_dotenv
 from src.schemas import DepartmentOutput
-from src.media_engine import export_srt_subtitles, generate_crop_ffmpeg_command
+from src.media_engine import generate_crop_ffmpeg_command, generate_srt_file
+
+load_dotenv()
+
+try:
+    from parallel import AsyncParallel
+except ImportError:
+    AsyncParallel = None
+
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
 
 # Initialize Parallel SDK client
 parallel_api_key = os.getenv("PARALLEL_API_KEY", "")
 parallel_client = (
     AsyncParallel(api_key=parallel_api_key) 
-    if parallel_api_key and parallel_api_key != "your_parallel_api_key_here" 
+    if AsyncParallel and parallel_api_key and parallel_api_key != "your_parallel_api_key_here"
     else None
 )
 
-async def script_and_subtitle_worker(script_text: str, languages: List[str]) -> DepartmentOutput:
-    """Worker 1: The Script & Subtitle Supervisor (Idiomatic Translation & .srt Exporter)."""
+def _transcribe_video_sync(client, video_url: str) -> str:
+    """Upload an HTTP(S) video to Gemini and return its spoken dialogue."""
+    prompt = (
+        "Listen carefully to the audio and inspect dialogue in this video. "
+        "If there is spoken dialogue, transcribe the exact spoken words. "
+        "If there is no spoken dialogue or only music/silence, return exactly "
+        "NO_SPEECH_DETECTED."
+    )
+    uploaded_file = None
+    temporary_path = None
+    try:
+        if video_url.startswith("gs://"):
+            video_part = types.Part.from_uri(file_uri=video_url, mime_type="video/mp4")
+        elif video_url.startswith(("http://", "https://")):
+            request = urllib.request.Request(video_url, headers={"User-Agent": "SlateParallel/1.0"})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                content_length = int(response.headers.get("Content-Length", "0"))
+                max_bytes = 100 * 1024 * 1024
+                if content_length > max_bytes:
+                    raise ValueError("Video exceeds the 100 MB upload limit")
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temporary_file:
+                    temporary_path = temporary_file.name
+                    total_bytes = 0
+                    while chunk := response.read(1024 * 1024):
+                        total_bytes += len(chunk)
+                        if total_bytes > max_bytes:
+                            raise ValueError("Video exceeds the 100 MB upload limit")
+                        temporary_file.write(chunk)
+
+            uploaded_file = client.files.upload(file=temporary_path)
+            deadline = time.monotonic() + 120
+            while not uploaded_file.state or uploaded_file.state.name != "ACTIVE":
+                state_name = uploaded_file.state.name if uploaded_file.state else "PROCESSING"
+                if time.monotonic() >= deadline or state_name == "FAILED":
+                    raise RuntimeError("Gemini could not process the uploaded video")
+                time.sleep(2)
+                uploaded_file = client.files.get(name=uploaded_file.name)
+            video_part = uploaded_file
+        else:
+            raise ValueError("Video URL must use https://, http://, or gs://")
+
+        response = client.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            contents=[video_part, prompt],
+        )
+        return (response.text or "").strip()
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        if uploaded_file:
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+
+
+async def run_script_subtitle_worker(
+    video_url: str,
+    script_text: str,
+    target_languages: List[str],
+    title: str,
+) -> DepartmentOutput:
+    """Inspect source-video dialogue, then translate and export localized subtitles."""
     start_time = time.time()
-    await asyncio.sleep(0.4)
-    
-    raw_subtitles = {
-        lang: f"[{lang} Localized Track] We have to venture into the subconscious mind."
-        for lang in languages
-    }
-    
-    saved_srt_paths = export_srt_subtitles("Inception 2 Teaser", raw_subtitles)
-        
+    detected_dialogue = ""
+    source_used = "unavailable"
+    transcription_error = None
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    if genai and types and api_key:
+        try:
+            client = genai.Client(api_key=api_key)
+            transcription = await asyncio.to_thread(_transcribe_video_sync, client, video_url)
+            if transcription and "NO_SPEECH_DETECTED" not in transcription:
+                detected_dialogue = transcription
+                source_used = "video_transcription"
+            elif script_text.strip():
+                detected_dialogue = script_text.strip()
+                source_used = "master_script_fallback"
+        except Exception as exc:
+            print(f"[Worker 01 Multimodal Fallback]: {exc}")
+            transcription_error = str(exc)
+    elif script_text.strip():
+        detected_dialogue = script_text.strip()
+        source_used = "master_script_fallback (gemini_not_configured)"
+    else:
+        transcription_error = "Gemini is not configured; provide GEMINI_API_KEY to transcribe video dialogue."
+
+    if not detected_dialogue and script_text.strip():
+        detected_dialogue = script_text.strip()
+        source_used = "master_script_fallback"
+
+    localized_dialogues = {}
+    subtitle_files = {}
+    client = genai.Client(api_key=api_key) if genai and api_key else None
+
+    for language in target_languages:
+        translated_text = ""
+        if client and detected_dialogue:
+            try:
+                translation_prompt = (
+                    f"Translate the following movie dialogue into natural, idiomatic {language}. "
+                    f"Return only the translated text:\n\n{detected_dialogue}"
+                )
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                    contents=translation_prompt,
+                )
+                translated_text = (response.text or "").strip() or detected_dialogue
+            except Exception as exc:
+                print(f"[Worker 01 Translation Fallback ({language})]: {exc}")
+                transcription_error = transcription_error or str(exc)
+
+        localized_dialogues[language] = translated_text
+        if translated_text:
+            subtitle_files[language] = generate_srt_file(title, language, translated_text)
+
     return DepartmentOutput(
         worker_id="worker_01",
         department_name="Script & Subtitle Supervisor",
         status="SUCCESS",
-        data={"subtitle_files": saved_srt_paths},
+        data={
+            "transcription_source": source_used,
+            "active_dialogue": detected_dialogue,
+            "localized_dialogues": localized_dialogues,
+            "subtitle_files": subtitle_files,
+            "transcription_error": transcription_error,
+        },
         execution_time_seconds=round(time.time() - start_time, 2)
     )
+
+
+# Backwards-compatible alias for callers using the original worker name.
+async def script_and_subtitle_worker(script_text: str, languages: List[str]) -> DepartmentOutput:
+    return await run_script_subtitle_worker("", script_text, languages, "Untitled Project")
 
 async def sound_stage_dubbing_worker(script_text: str, languages: List[str]) -> DepartmentOutput:
     """Worker 2: Sound Stage & Dubbing Lead."""

@@ -5,7 +5,10 @@ from typing import List, Dict, Any
 class MediaJobRequest(BaseModel):
     """Input payload submitted by the studio producer."""
     title: str = Field(..., description="Project title or movie trailer name")
-    script_text: str = Field(..., description="Master script scene or transcript")
+    script_text: str = Field(
+        default="",
+        description="Optional master script used only when source-video dialogue is unavailable",
+    )
     video_url: str = Field(..., description="URL or local path to raw master footage")
     target_languages: List[str] = Field(
         default_factory=lambda: ["Japanese", "Spanish", "French"],

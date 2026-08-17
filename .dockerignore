@@ -1,4 +1,5 @@
 venv/
+.venv/
 .env
 gcp-key.json
 outputs/

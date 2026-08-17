@@ -5,9 +5,12 @@ import asyncio
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 
-# 1. Import vertexai directly
-import vertexai
-from vertexai.generative_models import GenerativeModel
+try:
+    import vertexai
+    from vertexai.generative_models import GenerativeModel
+except ImportError:
+    vertexai = None
+    GenerativeModel = None
 
 from src.schemas import DepartmentOutput, MediaJobRequest
 
@@ -35,16 +38,16 @@ async def synthesize_master_release_package(
     model_name = os.getenv("GOOGLE_CLOUD_MODEL", "gemini-2.5-flash")
     
     # 2. MUST call vertexai.init() to bind project & location for GenerativeModel
-    try:
-        vertexai.init(project=project_id, location=location)
-    except Exception as e:
-        print(f"⚠️ Vertex AI Init Notice: {e}")
-    
-    # 3. Instantiate model with standard model ID
-    model = GenerativeModel(
-        model_name=model_name,
-        system_instruction=SHOWRUNNER_SYSTEM_INSTRUCTION
-    )
+    model = None
+    if vertexai and GenerativeModel:
+        try:
+            vertexai.init(project=project_id, location=location)
+            model = GenerativeModel(
+                model_name=model_name,
+                system_instruction=SHOWRUNNER_SYSTEM_INSTRUCTION,
+            )
+        except Exception as e:
+            print(f"⚠️ Vertex AI Init Notice: {e}")
     
     serialized_outputs = [output.model_dump() for output in worker_outputs]
     prompt_payload = {
@@ -61,6 +64,8 @@ async def synthesize_master_release_package(
     )
     
     try:
+        if model is None:
+            raise RuntimeError("Vertex AI SDK is not installed or configured")
         # Wrap synchronous call for asyncio runtime
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(

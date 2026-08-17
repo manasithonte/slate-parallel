@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from src.schemas import MediaJobRequest
 from src.workers import (
-    script_and_subtitle_worker,
+    run_script_subtitle_worker,
     sound_stage_dubbing_worker,
     smart_reframing_vfx_worker,
     global_standards_compliance_worker
@@ -43,7 +43,12 @@ async def process_media_job(job_request: MediaJobRequest):
     try:
         # 1. FAN-OUT: Run all 4 workers concurrently
         worker_results = await asyncio.gather(
-            script_and_subtitle_worker(job_request.script_text, job_request.target_languages),
+            run_script_subtitle_worker(
+                job_request.video_url,
+                job_request.script_text,
+                job_request.target_languages,
+                job_request.title,
+            ),
             sound_stage_dubbing_worker(job_request.script_text, job_request.target_languages),
             smart_reframing_vfx_worker(job_request.video_url, job_request.target_platforms),
             global_standards_compliance_worker(job_request.script_text, job_request.target_languages)
