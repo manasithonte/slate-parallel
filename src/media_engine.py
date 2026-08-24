@@ -95,17 +95,33 @@ Certified by SlateParallel Automated Guardian Agent.
     return filepath
 
 
+def get_crop_parameters(aspect_ratio: str) -> dict:
+    """Map a target aspect ratio to its crop definition.
+
+    Shared by the ffmpeg command-string generator below and the Transcoder
+    job builder in render_engine.py, so the two crop logics can't drift.
+    """
+    if "9:16" in aspect_ratio:
+        return {
+            "ffmpeg_filter": "crop=ih*(9/16):ih:(iw-ih*(9/16))/2:0",
+            "output_tag": "9x16_vertical",
+            "aspect_ratio": "9:16",
+        }
+    if "1:1" in aspect_ratio:
+        return {
+            "ffmpeg_filter": "crop=ih:ih:(iw-ih)/2:0",
+            "output_tag": "1x1_square",
+            "aspect_ratio": "1:1",
+        }
+    return {
+        "ffmpeg_filter": "copy",
+        "output_tag": "16x9_master",
+        "aspect_ratio": "16:9",
+    }
+
+
 def generate_crop_ffmpeg_command(input_video_path: str, aspect_ratio: str) -> str:
     """Generate an FFmpeg crop command for a target delivery aspect ratio."""
-    if "9:16" in aspect_ratio:
-        crop_filter = "crop=ih*(9/16):ih:(iw-ih*(9/16))/2:0"
-        output_tag = "9x16_vertical"
-    elif "1:1" in aspect_ratio:
-        crop_filter = "crop=ih:ih:(iw-ih)/2:0"
-        output_tag = "1x1_square"
-    else:
-        crop_filter = "copy"
-        output_tag = "16x9_master"
-
-    output_filename = f"outputs/trailer_{output_tag}.mp4"
-    return f"ffmpeg -i {input_video_path} -vf '{crop_filter}' -c:a copy {output_filename}"
+    crop = get_crop_parameters(aspect_ratio)
+    output_filename = f"outputs/trailer_{crop['output_tag']}.mp4"
+    return f"ffmpeg -i {input_video_path} -vf '{crop['ffmpeg_filter']}' -c:a copy {output_filename}"

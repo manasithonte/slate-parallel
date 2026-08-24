@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from src.schemas import MediaJobRequest
+from src.schemas import MediaJobRequest, RenderJob, RenderJobRequest
 from src.workers import (
     run_script_subtitle_worker,
     sound_stage_dubbing_worker,
@@ -13,6 +13,7 @@ from src.workers import (
     global_standards_compliance_worker
 )
 from src.orchestrator import synthesize_master_release_package
+from src.render_engine import submit_render_job, RENDER_JOBS
 
 app = FastAPI(
     title="slate-parallel API",
@@ -47,6 +48,34 @@ async def download_dubbed_audio(filename: str):
     if not audio_path.is_file():
         raise HTTPException(status_code=404, detail="Dubbed audio file not found")
     return FileResponse(audio_path, media_type="audio/mpeg", filename=safe_filename)
+
+@app.post("/api/v1/assemble-final", response_model=RenderJob)
+async def assemble_final_release(request: RenderJobRequest):
+    """
+    Final-assembly stage: submits one Google Cloud Transcoder job per
+    (platform x language) pair, combining the crop, dubbed audio, and
+    subtitles from a prior /api/v1/process-media run into a rendered .mp4.
+    Returns immediately after submission; poll /api/v1/render-status/{id}
+    for completion. Falls back to a NOT_CONFIGURED status if GCS/Transcoder
+    aren't set up, rather than failing the request.
+    """
+    try:
+        return await submit_render_job(request)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Render submission error: {str(e)}")
+
+
+@app.get("/api/v1/render-status/{render_job_id}", response_model=RenderJob)
+async def get_render_status(render_job_id: str):
+    """Poll the status of a submitted final-assembly render job."""
+    job = RENDER_JOBS.get(render_job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail="Render job not found (it may have been submitted to a different instance)",
+        )
+    return job
+
 
 @app.post("/api/v1/process-media")
 async def process_media_job(job_request: MediaJobRequest):
