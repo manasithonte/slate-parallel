@@ -21,10 +21,15 @@ import {
 const RENDER_POLL_INTERVAL_MS = 5000;
 const RENDER_ACTIVE_STATUSES = new Set(["PENDING", "SUBMITTED"]);
 
-const API_BASE_URL = "http://127.0.0.1:8080";
+const API_BASE_URL = "http://127.0.0.1:8000";
 
 const AVAILABLE_LANGUAGES = ["Japanese", "Spanish", "French", "German"];
 const AVAILABLE_PLATFORMS = ["TikTok (9:16)", "Instagram Post (1:1)"];
+
+const PLATFORM_FRAME_STYLES = {
+  "TikTok (9:16)": { label: "TikTok (9:16 Vertical Cut)", box: "w-32 h-56", border: "border-indigo-500/40" },
+  "Instagram Post (1:1)": { label: "Instagram (1:1 Square Cut)", box: "w-44 h-44", border: "border-violet-500/40" },
+};
 
 const LANG_VOICE_CODES = {
   Japanese: 'ja-JP',
@@ -51,6 +56,12 @@ export default function App() {
   )?.data;
   const workerTwoData = pipelineData?.master_release_package?.raw_department_data?.find(
     worker => worker.worker_id === "worker_02"
+  )?.data;
+  const workerThreeData = pipelineData?.master_release_package?.raw_department_data?.find(
+    worker => worker.worker_id === "worker_03"
+  )?.data;
+  const workerFourData = pipelineData?.master_release_package?.raw_department_data?.find(
+    worker => worker.worker_id === "worker_04"
   )?.data;
 
   const [workerStates, setWorkerStates] = useState({
@@ -516,36 +527,42 @@ export default function App() {
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
-                  <div className="p-3 bg-slate-900 rounded-lg border border-slate-800 flex flex-col items-center">
-                    <p className="text-xs font-semibold text-slate-300 mb-2">TikTok (9:16 Vertical Cut)</p>
-                    <div className="w-32 h-56 bg-black rounded-lg overflow-hidden border border-indigo-500/40 relative shadow-inner">
-                      <video
-                        src={formData.video_url}
-                        controls
-                        autoPlay
-                        muted
-                        loop
-                        playsInline
-                        crossOrigin="anonymous"
-                        className="object-cover w-full h-full"
-                      />
-                    </div>
-                  </div>
-                  <div className="p-3 bg-slate-900 rounded-lg border border-slate-800 flex flex-col items-center">
-                    <p className="text-xs font-semibold text-slate-300 mb-2">Instagram (1:1 Square Cut)</p>
-                    <div className="w-44 h-44 bg-black rounded-lg overflow-hidden border border-violet-500/40 relative shadow-inner">
-                      <video
-                        src={formData.video_url}
-                        controls
-                        autoPlay
-                        muted
-                        loop
-                        playsInline
-                        crossOrigin="anonymous"
-                        className="object-cover w-full h-full"
-                      />
-                    </div>
-                  </div>
+                  {selectedPlatforms.map(platform => {
+                    const style = PLATFORM_FRAME_STYLES[platform] || {
+                      label: platform, box: "w-40 h-40", border: "border-slate-600/40"
+                    };
+                    const ffmpegCommand = workerThreeData?.ffmpeg_render_pipeline?.[platform];
+
+                    return (
+                      <div key={platform} className="p-3 bg-slate-900 rounded-lg border border-slate-800 flex flex-col items-center">
+                        <p className="text-xs font-semibold text-slate-300 mb-2">{style.label}</p>
+                        <div className={`${style.box} bg-black rounded-lg overflow-hidden border ${style.border} relative shadow-inner`}>
+                          <video
+                            src={formData.video_url}
+                            controls
+                            autoPlay
+                            muted
+                            loop
+                            playsInline
+                            crossOrigin="anonymous"
+                            className="object-cover w-full h-full"
+                          />
+                        </div>
+                        <button
+                          disabled={!ffmpegCommand}
+                          onClick={() => triggerDownload(
+                            `${formData.title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${platform.replace(/[^a-z0-9]/gi, '_')}_crop.sh`,
+                            ffmpegCommand || ""
+                          )}
+                          className="mt-2 w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 bg-slate-950 hover:bg-slate-800 border border-slate-800 rounded-lg text-[10px] font-mono text-slate-400 disabled:cursor-not-allowed disabled:opacity-50 transition"
+                          title={ffmpegCommand}
+                        >
+                          <Download className="w-3 h-3" />
+                          <span>Download FFmpeg Crop Cmd</span>
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
 
                 {/* Final Assembly (Google Cloud Transcoder) — additive stage */}
@@ -614,17 +631,18 @@ export default function App() {
               {/* 3. Subtitles & Official Clearance Certificates Downloads */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {selectedLanguages.map(lang => {
-                  const localizedText = workerOneData?.localized_dialogues?.[lang];
+                  const subtitlePath = workerOneData?.subtitle_files?.[lang];
+                  const subtitleFilename = subtitlePath?.split("/").pop();
 
                   return (
-                  <button
+                  <a
                     key={lang}
-                    disabled={!localizedText}
-                    onClick={() => triggerDownload(
-                      `${formData.title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${lang.toLowerCase()}.srt`,
-                      `1\n00:00:01,000 --> 00:00:04,500\n[${lang.toUpperCase()}] ${localizedText}\n`
-                    )}
-                    className="p-3 bg-slate-950 hover:bg-slate-900 border border-slate-800 hover:border-indigo-500/60 rounded-xl flex items-center justify-between transition text-left disabled:cursor-not-allowed disabled:opacity-50"
+                    href={subtitleFilename ? `${API_BASE_URL}/api/v1/downloads/subtitle/${encodeURIComponent(subtitleFilename)}` : undefined}
+                    download={subtitleFilename}
+                    aria-disabled={!subtitleFilename}
+                    className={`p-3 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between transition text-left ${
+                      subtitleFilename ? 'hover:bg-slate-900 hover:border-indigo-500/60' : 'cursor-not-allowed opacity-50 pointer-events-none'
+                    }`}
                   >
                     <div className="flex items-center gap-2.5">
                       <FileText className="w-4 h-4 text-indigo-400" />
@@ -634,16 +652,24 @@ export default function App() {
                       </div>
                     </div>
                     <Download className="w-4 h-4 text-slate-400" />
-                  </button>
+                  </a>
                   );
                 })}
 
                 <button
+                  disabled={!workerFourData}
                   onClick={() => triggerDownload(
                     `${formData.title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_compliance_certificate.txt`,
-                    `========================================\nSLATEPARALLEL COMPLIANCE AUDIT CERTIFICATE\nProject: ${formData.title}\nStatus: APPROVED\nRatings: MPAA (PG-13), CERO (G), BBFC (12A)\nParallel Task ID: pal_task_live\n========================================`
+                    `========================================\n` +
+                    `SLATEPARALLEL COMPLIANCE AUDIT CERTIFICATE\n` +
+                    `Project: ${formData.title}\n` +
+                    `Status: ${pipelineData?.master_release_package?.gemini_director_report?.status || "APPROVED"}\n` +
+                    `Parallel Interaction ID: ${workerFourData?.parallel_interaction_id || "n/a"}\n` +
+                    `Live Web Context: ${workerFourData?.live_web_context || "n/a"}\n` +
+                    `Compliance Checks:\n${(workerFourData?.compliance_checks || []).map(c => ` - ${c}`).join("\n")}\n` +
+                    `========================================`
                   )}
-                  className="p-3 bg-slate-950 hover:bg-slate-900 border border-slate-800 hover:border-emerald-500/60 rounded-xl flex items-center justify-between transition text-left"
+                  className="p-3 bg-slate-950 hover:bg-slate-900 border border-slate-800 hover:border-emerald-500/60 rounded-xl flex items-center justify-between transition text-left disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <div className="flex items-center gap-2.5">
                     <FileCheck className="w-4 h-4 text-emerald-400" />

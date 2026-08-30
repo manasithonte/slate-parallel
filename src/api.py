@@ -22,6 +22,7 @@ app = FastAPI(
 )
 
 OUTPUT_AUDIO_DIR = Path("outputs") / "audio"
+OUTPUT_SUBTITLE_DIR = Path("outputs") / "subtitles"
 
 # Enable CORS for frontend dashboard calls
 app.add_middleware(
@@ -48,6 +49,17 @@ async def download_dubbed_audio(filename: str):
     if not audio_path.is_file():
         raise HTTPException(status_code=404, detail="Dubbed audio file not found")
     return FileResponse(audio_path, media_type="audio/mpeg", filename=safe_filename)
+
+@app.get("/api/v1/downloads/subtitle/{filename}")
+async def download_subtitle(filename: str):
+    """Download a generated localized .srt subtitle file as an attachment."""
+    safe_filename = Path(filename).name
+    if safe_filename != filename or not safe_filename.endswith(".srt"):
+        raise HTTPException(status_code=400, detail="Invalid subtitle filename")
+    subtitle_path = OUTPUT_SUBTITLE_DIR / safe_filename
+    if not subtitle_path.is_file():
+        raise HTTPException(status_code=404, detail="Subtitle file not found")
+    return FileResponse(subtitle_path, media_type="application/x-subrip", filename=safe_filename)
 
 @app.post("/api/v1/assemble-final", response_model=RenderJob)
 async def assemble_final_release(request: RenderJobRequest):
