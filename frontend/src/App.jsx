@@ -23,7 +23,7 @@ const RENDER_ACTIVE_STATUSES = new Set(["PENDING", "SUBMITTED"]);
 
 const API_BASE_URL = "http://127.0.0.1:8000";
 
-const AVAILABLE_LANGUAGES = ["Japanese", "Spanish", "French", "German"];
+const AVAILABLE_LANGUAGES = ["English", "Japanese", "Spanish", "French", "German"];
 const AVAILABLE_PLATFORMS = ["TikTok (9:16)", "Instagram Post (1:1)"];
 
 const PLATFORM_FRAME_STYLES = {
@@ -32,6 +32,7 @@ const PLATFORM_FRAME_STYLES = {
 };
 
 const LANG_VOICE_CODES = {
+  English: 'en-US',
   Japanese: 'ja-JP',
   Spanish: 'es-ES',
   French: 'fr-FR',

@@ -15,6 +15,7 @@ os.makedirs(os.path.join(OUTPUT_DIR, "audio"), exist_ok=True)
 os.makedirs(os.path.join(OUTPUT_DIR, "compliance"), exist_ok=True)
 
 LANGUAGE_CODES = {
+    "English": "en-US",
     "Japanese": "ja-JP",
     "Spanish": "es-ES",
     "French": "fr-FR",
