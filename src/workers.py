@@ -148,6 +148,11 @@ async def run_script_subtitle_worker(
             except Exception as exc:
                 print(f"[Worker 01 Translation Fallback ({language})]: {exc}")
                 transcription_error = transcription_error or str(exc)
+                # Same graceful degradation as a successful-but-empty response
+                # above — without this, a transient Gemini error (rate limit,
+                # safety-filter block, etc.) leaves this language with no
+                # dialogue at all instead of falling back to the source text.
+                translated_text = detected_dialogue
 
         localized_dialogues[language] = translated_text
         if translated_text:
