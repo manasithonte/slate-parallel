@@ -1,6 +1,7 @@
 # src/media_engine.py
 import os
 import re
+import subprocess
 
 try:
     from google.cloud import texttospeech
@@ -65,6 +66,22 @@ def generate_srt_file(title: str, language: str, text: str) -> str:
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(srt_content)
     return filepath
+
+def burn_in_subtitles(video_path: str, srt_path: str, output_path: str) -> None:
+    """Hard-burn a .srt track into the video's pixels via ffmpeg's libass-backed
+    `subtitles` filter. Cloud Transcoder rejects a standalone text stream muxed
+    into a plain mp4 (see render_engine.py), so this runs before staging."""
+    # The subtitles filter treats ':' and others as option separators — the
+    # path itself must be escaped, then quoted, when passed as a filter arg.
+    escaped_path = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vf", f"subtitles=filename='{escaped_path}'",
+            "-c:a", "copy", output_path,
+        ],
+        capture_output=True, text=True, timeout=300, check=True,
+    )
 
 def generate_compliance_certificate(title: str, clearances: dict) -> str:
     """Generates an official studio compliance audit report."""

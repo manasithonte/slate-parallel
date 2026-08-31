@@ -15,16 +15,18 @@ import asyncio
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from typing import Dict, Optional, Tuple
 from dotenv import load_dotenv
 
 from src import gcs_engine
-from src.media_engine import get_crop_parameters
+from src.media_engine import burn_in_subtitles, get_crop_parameters
 from src.schemas import RenderJob, RenderJobRequest, RenderJobStatus, RenderOutput
 
 try:
@@ -104,34 +106,42 @@ def _output_dimensions_for_platform(platform: str) -> Tuple[int, int]:
     return {"9:16": (720, 1280), "1:1": (720, 720), "16:9": (1280, 720)}[aspect_ratio]
 
 
-async def _stage_source_video(video_url: str, render_job_id: str) -> Tuple[str, int, int, float]:
-    """Ensure the source video is in GCS and return (gs:// uri, width, height, duration_seconds)."""
-    if video_url.startswith("gs://"):
-        parsed = urllib.parse.urlparse(video_url)
-        bucket_name, blob_name = parsed.netloc, parsed.path.lstrip("/")
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
-            local_path = temp_file.name
-        try:
-            bucket = gcs_engine._get_client().bucket(bucket_name)
-            await asyncio.to_thread(bucket.blob(blob_name).download_to_filename, local_path)
-            width, height, duration = await asyncio.to_thread(_probe_video_dimensions, local_path)
-        finally:
-            if os.path.exists(local_path):
-                os.remove(local_path)
-        return video_url, width, height, duration
-
-    gcs_uri = await asyncio.to_thread(gcs_engine.upload_source_video, video_url, render_job_id)
+def _download_source_to_local(video_url: str) -> str:
+    """Fetch the source video (gs://, http(s)://, or an existing local path)
+    to a local temp file so ffmpeg can burn per-language subtitles into it —
+    Transcoder can't read local paths, and burning must happen before the
+    per-language upload. Caller is responsible for deleting the result."""
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
         local_path = temp_file.name
-    try:
-        parsed = urllib.parse.urlparse(gcs_uri)
+
+    if video_url.startswith("gs://"):
+        parsed = urllib.parse.urlparse(video_url)
         bucket = gcs_engine._get_client().bucket(parsed.netloc)
-        await asyncio.to_thread(bucket.blob(parsed.path.lstrip("/")).download_to_filename, local_path)
-        width, height, duration = await asyncio.to_thread(_probe_video_dimensions, local_path)
-    finally:
-        if os.path.exists(local_path):
-            os.remove(local_path)
-    return gcs_uri, width, height, duration
+        bucket.blob(parsed.path.lstrip("/")).download_to_filename(local_path)
+        return local_path
+
+    if video_url.startswith(("http://", "https://")):
+        request = urllib.request.Request(video_url, headers={"User-Agent": "SlateParallel/1.0"})
+        max_bytes = 100 * 1024 * 1024
+        with urllib.request.urlopen(request, timeout=60) as response:
+            content_length = int(response.headers.get("Content-Length", "0"))
+            if content_length > max_bytes:
+                raise ValueError("Video exceeds the 100 MB upload limit")
+            total_bytes = 0
+            with open(local_path, "wb") as out:
+                while chunk := response.read(1024 * 1024):
+                    total_bytes += len(chunk)
+                    if total_bytes > max_bytes:
+                        raise ValueError("Video exceeds the 100 MB upload limit")
+                    out.write(chunk)
+        return local_path
+
+    if os.path.exists(video_url):
+        shutil.copyfile(video_url, local_path)
+        return local_path
+
+    os.remove(local_path)
+    raise ValueError("video_url must be gs://, http(s)://, or an existing local path")
 
 
 def _build_job(
@@ -197,8 +207,11 @@ def _build_job(
     # NOTE: Transcoder API confirmed (via a live 400 response — "expect no
     # standalone text streams in a ts/mp4 mux stream") that a TextStream
     # cannot be embedded into a plain mp4 MuxStream; captions only work in
-    # HLS/DASH manifest outputs, which this stage doesn't produce. Subtitles
-    # remain available separately as the .srt download from Worker 1.
+    # HLS/DASH manifest outputs, which this stage doesn't produce. Instead,
+    # subtitles are hard-burned into the video's pixels before this job ever
+    # runs (see burn_in_subtitles in media_engine.py, invoked per-language in
+    # _run_render_pipeline) — the "video-input" this job crops is already
+    # subtitled where a .srt track was available for that language.
     mux_elementary_streams = ["video-stream0", "audio-stream0"]
 
     # Transcoder derives an atom's implicit duration from its inputs and
@@ -275,8 +288,9 @@ async def _submit_and_poll(
 async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
     render_job = RENDER_JOBS[render_job_id]
     try:
-        video_gcs_uri, width, height, video_duration = await _stage_source_video(
-            request.video_url, render_job_id
+        local_source_path = await asyncio.to_thread(_download_source_to_local, request.video_url)
+        width, height, video_duration = await asyncio.to_thread(
+            _probe_video_dimensions, local_source_path
         )
     except Exception as exc:
         for output in render_job.outputs:
@@ -285,28 +299,64 @@ async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
         render_job.overall_status = RenderJobStatus.FAILED
         return
 
+    language_video_uris: Dict[str, str] = {}
     language_audio_uris: Dict[str, Optional[str]] = {}
     language_audio_durations: Dict[str, Optional[float]] = {}
-    for language in request.target_languages:
-        audio_path = request.dubbed_tracks.get(language)
-        if audio_path:
-            language_audio_durations[language] = await asyncio.to_thread(
-                _probe_audio_duration, audio_path
-            )
-            language_audio_uris[language] = await asyncio.to_thread(
-                gcs_engine.upload_to_gcs, audio_path,
-                f"renders/{render_job_id}/audio_{language.lower()}.mp3"
-            )
-        else:
-            language_audio_durations[language] = None
-            language_audio_uris[language] = None
+    burned_local_paths = []
+    plain_source_gcs_uri = None
+
+    try:
+        for language in request.target_languages:
+            srt_path = request.subtitle_files.get(language)
+            if srt_path and os.path.exists(srt_path):
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as burned_file:
+                    burned_path = burned_file.name
+                await asyncio.to_thread(burn_in_subtitles, local_source_path, srt_path, burned_path)
+                burned_local_paths.append(burned_path)
+                language_video_uris[language] = await asyncio.to_thread(
+                    gcs_engine.upload_to_gcs, burned_path,
+                    f"renders/{render_job_id}/video_{language.lower()}_subtitled.mp4",
+                )
+            else:
+                # No subtitle track for this language — reuse one shared
+                # plain upload of the un-burned source rather than re-upload
+                # it once per language.
+                if plain_source_gcs_uri is None:
+                    plain_source_gcs_uri = await asyncio.to_thread(
+                        gcs_engine.upload_to_gcs, local_source_path,
+                        f"renders/{render_job_id}/video_source_nosubs.mp4",
+                    )
+                language_video_uris[language] = plain_source_gcs_uri
+
+            audio_path = request.dubbed_tracks.get(language)
+            if audio_path:
+                language_audio_durations[language] = await asyncio.to_thread(
+                    _probe_audio_duration, audio_path
+                )
+                language_audio_uris[language] = await asyncio.to_thread(
+                    gcs_engine.upload_to_gcs, audio_path,
+                    f"renders/{render_job_id}/audio_{language.lower()}.mp3"
+                )
+            else:
+                language_audio_durations[language] = None
+                language_audio_uris[language] = None
+    except Exception as exc:
+        for output in render_job.outputs:
+            output.status = RenderJobStatus.FAILED
+            output.error = f"Subtitle burn-in / staging failed: {exc}"
+        render_job.overall_status = RenderJobStatus.FAILED
+        return
+    finally:
+        for path in [local_source_path] + burned_local_paths:
+            if path and os.path.exists(path):
+                os.remove(path)
 
     tasks = []
     index = 0
     for platform in request.target_platforms:
         for language in request.target_languages:
             tasks.append(_submit_and_poll(
-                render_job_id, index, platform, language, video_gcs_uri, width, height,
+                render_job_id, index, platform, language, language_video_uris[language], width, height,
                 video_duration, language_audio_uris[language], language_audio_durations[language],
             ))
             index += 1

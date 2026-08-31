@@ -41,11 +41,12 @@ Each worker returns a `DepartmentOutput` (`worker_id`, `department_name`, `statu
 POST /api/v1/assemble-final                 (call after process-media succeeds)
         │
         ▼
-  Google Cloud Transcoder job per (platform × language) pair
-  crops the video and muxes in the dubbed audio track,
-  renders one broadcast-ready .mp4 to GCS
-  (no embedded captions — Transcoder can't mux a text track into a
-  plain .mp4; subtitles stay available as the separate .srt download)
+  ffmpeg hard-burns each language's .srt subtitles into the source
+  video first (Transcoder can't mux a text track into a plain .mp4,
+  so captions are baked into pixels before this stage ever runs) —
+  Google Cloud Transcoder then crops the subtitled video per platform
+  and muxes in the dubbed audio track, rendering one broadcast-ready
+  .mp4 to GCS per (platform × language) pair
         │
         ▼
 GET /api/v1/render-status/{render_job_id}    (poll until SUCCEEDED/FAILED)
@@ -62,7 +63,7 @@ A separate, optional stage that combines worker_01/02/03's outputs into an actua
 - Compliance certificate generation (`generate_compliance_certificate` in `src/media_engine.py`) exists but is not yet wired into the API.
 - Every external integration (Gemini, Vertex AI, Parallel, Cloud TTS, GCS, Transcoder) has a safe fallback, so the pipeline runs end-to-end in "mock mode" without any credentials configured.
 - React dashboard (frontend/) polls the endpoint, shows live per-worker status, and lets you play/download dubbed audio and view subtitle and compliance results.
-- **Final assembly (Transcoder) is implemented and GCS upload/signed-URL/`NOT_CONFIGURED` fallback are verified against live infrastructure.** Crop, mono dub-audio channel mapping, and job submission are confirmed working against real Transcoder jobs. Embedded captions were attempted and dropped after Transcoder rejected a text stream inside a plain `.mp4` mux (API limitation, not a bug) — subtitles remain a separate `.srt` download. A full render has not yet been confirmed to reach `SUCCEEDED` end-to-end.
+- **Final assembly (Transcoder) is implemented and GCS upload/signed-URL/`NOT_CONFIGURED` fallback are verified against live infrastructure.** Crop, mono dub-audio channel mapping, and job submission are confirmed working against real Transcoder jobs. Embedding captions via a Transcoder TextStream was attempted and dropped after Transcoder rejected a text stream inside a plain `.mp4` mux (API limitation, not a bug); captions are now hard-burned into the video via ffmpeg (`burn_in_subtitles` in `src/media_engine.py`) per language before the Transcoder crop/mux job runs, so the final `.mp4` carries permanent, non-toggleable subtitles. This burn-in step depends on the ffmpeg binary having libass support (the Dockerfile's `apt-get install ffmpeg` on Debian slim normally includes it) and has not yet been confirmed end-to-end against a live Transcoder render.
 
 ## Project layout
 
