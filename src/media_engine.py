@@ -2,6 +2,7 @@
 import os
 import re
 import subprocess
+from typing import Optional
 
 try:
     from google.cloud import texttospeech
@@ -67,17 +68,32 @@ def generate_srt_file(title: str, language: str, text: str) -> str:
         f.write(srt_content)
     return filepath
 
-def burn_in_subtitles(video_path: str, srt_path: str, output_path: str) -> None:
-    """Hard-burn a .srt track into the video's pixels via ffmpeg's libass-backed
-    `subtitles` filter. Cloud Transcoder rejects a standalone text stream muxed
-    into a plain mp4 (see render_engine.py), so this runs before staging."""
-    # The subtitles filter treats ':' and others as option separators — the
-    # path itself must be escaped, then quoted, when passed as a filter arg.
-    escaped_path = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+def crop_and_burn_subtitles(
+    video_path: str, platform: str, srt_path: Optional[str], output_path: str
+) -> None:
+    """Crop to the platform's target aspect ratio, scale to its delivery
+    resolution, and (if given) hard-burn a .srt track into the *already
+    cropped and scaled* frame via ffmpeg's libass-backed `subtitles` filter.
+
+    Subtitles must be burned in after crop/scale, not before: burning onto
+    the full-width source and letting Transcoder crop afterward clips text
+    that falls outside the narrower crop window (confirmed by inspecting a
+    1:1 render where wide subtitle lines ran off-frame). Doing the crop
+    locally also means Cloud Transcoder — which rejects a standalone text
+    stream muxed into a plain mp4 — only has to re-encode and mux dub audio,
+    with no preprocessing crop of its own (see render_engine.py).
+    """
+    crop = get_crop_parameters(platform)
+    filters = [crop["ffmpeg_filter"], f"scale={crop['output_width']}:{crop['output_height']}"]
+    if srt_path:
+        # The subtitles filter treats ':' and others as option separators —
+        # the path itself must be escaped, then quoted, as a filter arg.
+        escaped_path = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        filters.append(f"subtitles=filename='{escaped_path}'")
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", video_path,
-            "-vf", f"subtitles=filename='{escaped_path}'",
+            "-vf", ",".join(filters),
             "-c:a", "copy", output_path,
         ],
         capture_output=True, text=True, timeout=300, check=True,
@@ -113,27 +129,35 @@ Certified by SlateParallel Automated Guardian Agent.
 
 
 def get_crop_parameters(aspect_ratio: str) -> dict:
-    """Map a target aspect ratio to its crop definition.
+    """Map a target aspect ratio to its crop definition and delivery
+    resolution.
 
-    Shared by the ffmpeg command-string generator below and the Transcoder
-    job builder in render_engine.py, so the two crop logics can't drift.
+    Shared by the ffmpeg command-string generator below, crop_and_burn_subtitles,
+    and the Transcoder job builder in render_engine.py, so the crop/scale
+    logic can't drift between the three.
     """
     if "9:16" in aspect_ratio:
         return {
             "ffmpeg_filter": "crop=ih*(9/16):ih:(iw-ih*(9/16))/2:0",
             "output_tag": "9x16_vertical",
             "aspect_ratio": "9:16",
+            "output_width": 720,
+            "output_height": 1280,
         }
     if "1:1" in aspect_ratio:
         return {
             "ffmpeg_filter": "crop=ih:ih:(iw-ih)/2:0",
             "output_tag": "1x1_square",
             "aspect_ratio": "1:1",
+            "output_width": 720,
+            "output_height": 720,
         }
     return {
-        "ffmpeg_filter": "copy",
+        "ffmpeg_filter": "null",
         "output_tag": "16x9_master",
         "aspect_ratio": "16:9",
+        "output_width": 1280,
+        "output_height": 720,
     }
 
 

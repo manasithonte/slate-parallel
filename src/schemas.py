@@ -11,9 +11,13 @@ class MediaJobRequest(BaseModel):
         description="Optional master script used only when source-video dialogue is unavailable",
     )
     video_url: str = Field(..., description="URL or local path to raw master footage")
-    target_languages: List[str] = Field(
+    dubbing_languages: List[str] = Field(
+        default_factory=lambda: ["Japanese", "Spanish"],
+        description="Languages to synthesize dubbed voiceover audio for"
+    )
+    subtitle_languages: List[str] = Field(
         default_factory=lambda: ["Japanese", "Spanish", "French"],
-        description="Target localization languages"
+        description="Languages to generate translated subtitle tracks for"
     )
     target_platforms: List[str] = Field(
         default_factory=lambda: ["YouTube (16:9)", "TikTok (9:16)", "Instagram (1:1)"],
@@ -39,14 +43,25 @@ class RenderJobStatus(str, Enum):
 
 
 class RenderOutput(BaseModel):
-    """Status of one platform x language combination in a render job."""
+    """Status of one platform's render, carrying whichever dub/subtitle
+    language it was configured with (either may be None — a platform can be
+    rendered with only a dub, only subtitles, or neither)."""
     platform: str
-    language: str
+    dub_language: Optional[str] = None
+    subtitle_language: Optional[str] = None
     status: RenderJobStatus
     transcoder_job_name: Optional[str] = None
     output_gcs_uri: Optional[str] = None
     download_url: Optional[str] = None
     error: Optional[str] = None
+
+
+class PlatformRendition(BaseModel):
+    """One platform's chosen dub-audio and subtitle language for final
+    assembly — each is independently optional and need not match, e.g. an
+    English dub with burned-in Spanish subtitles."""
+    dub_language: Optional[str] = None
+    subtitle_language: Optional[str] = None
 
 
 class RenderJobRequest(BaseModel):
@@ -57,8 +72,10 @@ class RenderJobRequest(BaseModel):
     """
     title: str
     video_url: str
-    target_languages: List[str]
-    target_platforms: List[str]
+    platform_renditions: Dict[str, PlatformRendition] = Field(
+        default_factory=dict,
+        description="Target platform -> chosen dub/subtitle language for that platform's render"
+    )
     localized_dialogues: Dict[str, str] = Field(default_factory=dict)
     subtitle_files: Dict[str, str] = Field(default_factory=dict)
     dubbed_tracks: Dict[str, str] = Field(default_factory=dict)

@@ -45,8 +45,24 @@ export default function App() {
     video_url: "https://vjs.zencdn.net/v/oceans.mp4",
   });
 
-  const [selectedLanguages, setSelectedLanguages] = useState(["Japanese", "Spanish"]);
+  const [selectedDubLanguages, setSelectedDubLanguages] = useState(["Japanese", "Spanish"]);
+  const [selectedSubtitleLanguages, setSelectedSubtitleLanguages] = useState(["Japanese", "Spanish", "French"]);
   const [selectedPlatforms, setSelectedPlatforms] = useState(["TikTok (9:16)", "Instagram Post (1:1)"]);
+
+  // Per-platform choice of which previously-selected dub/subtitle language to
+  // actually bake into that platform's final render. Only holds explicit user
+  // overrides — getPlatformRendition below fills in a default (falling back
+  // whenever a stored choice drops out of the current selection) at render
+  // time, rather than syncing derived state back in via an effect.
+  const [platformRenditions, setPlatformRenditions] = useState({});
+
+  const getPlatformRendition = (platform) => {
+    const override = platformRenditions[platform] || {};
+    return {
+      dubLanguage: selectedDubLanguages.includes(override.dubLanguage) ? override.dubLanguage : (selectedDubLanguages[0] || ""),
+      subtitleLanguage: selectedSubtitleLanguages.includes(override.subtitleLanguage) ? override.subtitleLanguage : (selectedSubtitleLanguages[0] || ""),
+    };
+  };
 
   const [loading, setLoading] = useState(false);
   const [pipelineData, setPipelineData] = useState(null);
@@ -100,8 +116,15 @@ export default function App() {
     const payload = {
       title: formData.title,
       video_url: formData.video_url,
-      target_languages: selectedLanguages,
-      target_platforms: selectedPlatforms,
+      platform_renditions: Object.fromEntries(
+        selectedPlatforms.map(platform => {
+          const rendition = getPlatformRendition(platform);
+          return [platform, {
+            dub_language: rendition.dubLanguage || null,
+            subtitle_language: rendition.subtitleLanguage || null,
+          }];
+        })
+      ),
       localized_dialogues: workerOneData?.localized_dialogues || {},
       subtitle_files: workerOneData?.subtitle_files || {},
       dubbed_tracks: workerTwoData?.dubbed_tracks || {},
@@ -123,12 +146,16 @@ export default function App() {
     }
   };
 
-  const toggleLanguage = (lang) => {
-    if (selectedLanguages.includes(lang)) {
-      if (selectedLanguages.length > 1) setSelectedLanguages(selectedLanguages.filter(l => l !== lang));
-    } else {
-      setSelectedLanguages([...selectedLanguages, lang]);
-    }
+  const toggleDubLanguage = (lang) => {
+    setSelectedDubLanguages(prev =>
+      prev.includes(lang) ? prev.filter(l => l !== lang) : [...prev, lang]
+    );
+  };
+
+  const toggleSubtitleLanguage = (lang) => {
+    setSelectedSubtitleLanguages(prev =>
+      prev.includes(lang) ? prev.filter(l => l !== lang) : [...prev, lang]
+    );
   };
 
   const togglePlatform = (plat) => {
@@ -196,7 +223,8 @@ export default function App() {
       title: formData.title,
       script_text: formData.script_text,
       video_url: formData.video_url,
-      target_languages: selectedLanguages,
+      dubbing_languages: selectedDubLanguages,
+      subtitle_languages: selectedSubtitleLanguages,
       target_platforms: selectedPlatforms
     };
 
@@ -295,22 +323,43 @@ export default function App() {
                 />
               </div>
 
-              {/* Target Languages */}
+              {/* Dubbing Languages */}
               <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1.5">Target Regional Languages</label>
+                <label className="block text-xs font-medium text-slate-400 mb-1.5">Dubbing Languages (Voice)</label>
                 <div className="flex flex-wrap gap-1.5">
                   {AVAILABLE_LANGUAGES.map(lang => (
                     <button
                       type="button"
                       key={lang}
-                      onClick={() => toggleLanguage(lang)}
+                      onClick={() => toggleDubLanguage(lang)}
                       className={`text-xs px-2.5 py-1 rounded-lg border transition ${
-                        selectedLanguages.includes(lang)
+                        selectedDubLanguages.includes(lang)
                           ? 'bg-indigo-600/30 text-indigo-300 border-indigo-500/60'
                           : 'bg-slate-950 text-slate-500 border-slate-800'
                       }`}
                     >
-                      {selectedLanguages.includes(lang) && "✓ "}{lang}
+                      {selectedDubLanguages.includes(lang) && "✓ "}{lang}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Subtitle Languages */}
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1.5">Subtitle Languages (Captions)</label>
+                <div className="flex flex-wrap gap-1.5">
+                  {AVAILABLE_LANGUAGES.map(lang => (
+                    <button
+                      type="button"
+                      key={lang}
+                      onClick={() => toggleSubtitleLanguage(lang)}
+                      className={`text-xs px-2.5 py-1 rounded-lg border transition ${
+                        selectedSubtitleLanguages.includes(lang)
+                          ? 'bg-sky-600/30 text-sky-300 border-sky-500/60'
+                          : 'bg-slate-950 text-slate-500 border-slate-800'
+                      }`}
+                    >
+                      {selectedSubtitleLanguages.includes(lang) && "✓ "}{lang}
                     </button>
                   ))}
                 </div>
@@ -455,7 +504,7 @@ export default function App() {
                   </p>
                 </div>
 
-                {selectedLanguages.map(lang => {
+                {selectedDubLanguages.map(lang => {
                   const dubbedTrackPath = workerTwoData?.dubbed_tracks?.[lang];
                   const downloadedFilename = dubbedTrackPath?.split("/").pop();
 
@@ -567,23 +616,50 @@ export default function App() {
 
                 {/* Final Assembly (Google Cloud Transcoder) — additive stage */}
                 <div className="pt-3 mt-1 border-t border-slate-800 space-y-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="text-[11px] text-slate-500">
-                      Render broadcast-ready .mp4s combining the crop, dub audio, and subtitles above via Google Cloud Transcoder.
-                    </p>
-                    <button
-                      onClick={handleAssembleFinal}
-                      disabled={renderSubmitting || !workerTwoData}
-                      className="shrink-0 flex items-center gap-2 px-3.5 py-2 bg-violet-600 hover:bg-violet-500 rounded-lg text-xs font-semibold text-white shadow-lg shadow-violet-600/20 transition disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      {renderSubmitting ? (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      ) : (
-                        <Film className="w-4 h-4" />
-                      )}
-                      <span>Render Final Video</span>
-                    </button>
+                  <p className="text-[11px] text-slate-500">
+                    Render broadcast-ready .mp4s combining the crop, dub audio, and subtitles above via Google Cloud Transcoder.
+                    Choose which language to use for each platform (from what you selected above):
+                  </p>
+
+                  <div className="space-y-1.5">
+                    {selectedPlatforms.map(platform => {
+                      const rendition = getPlatformRendition(platform);
+                      return (
+                        <div key={platform} className="flex flex-col sm:flex-row sm:items-center gap-2 p-2.5 bg-slate-900/60 rounded-lg border border-slate-800">
+                          <span className="text-xs font-semibold text-slate-300 sm:w-36 shrink-0">{platform}</span>
+                          <select
+                            value={rendition.dubLanguage}
+                            onChange={(e) => setPlatformRenditions(prev => ({ ...prev, [platform]: { ...prev[platform], dubLanguage: e.target.value } }))}
+                            className="flex-1 px-2 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-slate-200"
+                          >
+                            <option value="">No dub audio</option>
+                            {selectedDubLanguages.map(lang => <option key={lang} value={lang}>{lang} dub</option>)}
+                          </select>
+                          <select
+                            value={rendition.subtitleLanguage}
+                            onChange={(e) => setPlatformRenditions(prev => ({ ...prev, [platform]: { ...prev[platform], subtitleLanguage: e.target.value } }))}
+                            className="flex-1 px-2 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-slate-200"
+                          >
+                            <option value="">No subtitles</option>
+                            {selectedSubtitleLanguages.map(lang => <option key={lang} value={lang}>{lang} subs</option>)}
+                          </select>
+                        </div>
+                      );
+                    })}
                   </div>
+
+                  <button
+                    onClick={handleAssembleFinal}
+                    disabled={renderSubmitting || !workerTwoData}
+                    className="w-full flex items-center justify-center gap-2 px-3.5 py-2 bg-violet-600 hover:bg-violet-500 rounded-lg text-xs font-semibold text-white shadow-lg shadow-violet-600/20 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {renderSubmitting ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Film className="w-4 h-4" />
+                    )}
+                    <span>Render Final Video</span>
+                  </button>
 
                   {renderJob && (
                     <div className="space-y-2">
@@ -592,12 +668,13 @@ export default function App() {
                       </p>
                       {renderJob.outputs.map((output) => (
                         <div
-                          key={`${output.platform}-${output.language}`}
+                          key={`${output.platform}-${output.dub_language}-${output.subtitle_language}`}
                           className="flex items-center justify-between gap-3 p-2.5 bg-slate-900/90 rounded-lg border border-slate-800"
                         >
                           <div className="text-xs text-slate-300">
-                            <span className="font-semibold text-white">{output.language}</span>
-                            {" · "}{output.platform}
+                            <span className="font-semibold text-white">{output.platform}</span>
+                            {" · "}{output.dub_language ? `${output.dub_language} dub` : "no dub"}
+                            {" + "}{output.subtitle_language ? `${output.subtitle_language} subs` : "no subs"}
                             {output.error && (
                               <p className="text-[10px] text-rose-400 mt-0.5 max-w-xs truncate" title={output.error}>
                                 {output.error}
@@ -630,7 +707,7 @@ export default function App() {
 
               {/* 3. Subtitles & Official Clearance Certificates Downloads */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {selectedLanguages.map(lang => {
+                {selectedSubtitleLanguages.map(lang => {
                   const subtitlePath = workerOneData?.subtitle_files?.[lang];
                   const subtitleFilename = subtitlePath?.split("/").pop();
 

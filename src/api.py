@@ -98,20 +98,34 @@ async def process_media_job(job_request: MediaJobRequest):
     start_time = time.time()
     
     try:
+        # Worker 01 translates for the union of both language pools — dubbing
+        # needs translated text same as subtitles do — so a language picked
+        # only for dubbing (not subtitles) still gets a translation to dub.
+        all_languages = list(dict.fromkeys(
+            job_request.dubbing_languages + job_request.subtitle_languages
+        ))
+
         # 1. FAN-OUT: Run all 4 workers concurrently
         worker_01, worker_03, worker_04 = await asyncio.gather(
             run_script_subtitle_worker(
                 job_request.video_url,
                 job_request.script_text,
-                job_request.target_languages,
+                all_languages,
                 job_request.title,
             ),
             smart_reframing_vfx_worker(job_request.video_url, job_request.target_platforms),
-            global_standards_compliance_worker(job_request.script_text, job_request.target_languages),
+            global_standards_compliance_worker(job_request.script_text, all_languages),
         )
+        # Worker 02 only synthesizes audio for languages actually requested
+        # for dubbing, even though worker_01 translated a possibly larger set.
+        dubbing_dialogues = {
+            lang: text
+            for lang, text in worker_01.data.get("localized_dialogues", {}).items()
+            if lang in job_request.dubbing_languages
+        }
         worker_02 = await sound_stage_dubbing_worker(
             job_request.title,
-            worker_01.data.get("localized_dialogues", {}),
+            dubbing_dialogues,
         )
         worker_results = [worker_01, worker_02, worker_03, worker_04]
         

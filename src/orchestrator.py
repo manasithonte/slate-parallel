@@ -53,7 +53,8 @@ async def synthesize_master_release_package(
     prompt_payload = {
         "project_title": job_request.title,
         "script": job_request.script_text,
-        "target_languages": job_request.target_languages,
+        "dubbing_languages": job_request.dubbing_languages,
+        "subtitle_languages": job_request.subtitle_languages,
         "target_platforms": job_request.target_platforms,
         "department_results": serialized_outputs
     }
@@ -82,7 +83,8 @@ async def synthesize_master_release_package(
             "gemini_qc_notes": f"Fallback synthesis active: {str(e)}",
             "summary": f"Master package synthesized for '{job_request.title}'. All 4 department outputs validated.",
             "target_coverage": {
-                "languages": job_request.target_languages,
+                "dubbing_languages": job_request.dubbing_languages,
+                "subtitle_languages": job_request.subtitle_languages,
                 "platforms": job_request.target_platforms
             }
         }
