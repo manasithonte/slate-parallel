@@ -8,9 +8,10 @@ Agentic post-production localization and QC orchestrator for film/media trailers
 POST /api/v1/process-media
         │
         ├── Worker 01 · Script & Subtitle Supervisor
+        │     uses a supplied master script if given (skips the slower
+        │     video upload/transcription step entirely); otherwise
         │     transcribes source-video dialogue (Gemini multimodal),
-        │     falls back to a supplied script, translates per target
-        │     language, writes .srt subtitle files
+        │     translates per target language, writes .srt subtitle files
         │
         ├── Worker 03 · Smart Reframing Director (VFX)
         │     generates FFmpeg crop commands per target platform

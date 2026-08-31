@@ -4,7 +4,7 @@ import asyncio
 import time
 import tempfile
 import urllib.request
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from src.schemas import DepartmentOutput
 from src.media_engine import (
@@ -104,56 +104,63 @@ async def run_script_subtitle_worker(
     transcription_error = None
     api_key = os.getenv("GEMINI_API_KEY")
 
-    if genai and types and api_key:
+    # A supplied master script wins outright — video transcription (upload +
+    # server-side processing) is the slowest step in the pipeline, and is
+    # only worth paying for when there's no script to fall back to.
+    if script_text.strip():
+        detected_dialogue = script_text.strip()
+        source_used = "master_script"
+    elif genai and types and api_key:
         try:
             client = genai.Client(api_key=api_key)
             transcription = await asyncio.to_thread(_transcribe_video_sync, client, video_url)
             if transcription and "NO_SPEECH_DETECTED" not in transcription:
                 detected_dialogue = transcription
                 source_used = "video_transcription"
-            elif script_text.strip():
-                detected_dialogue = script_text.strip()
-                source_used = "master_script_fallback"
+            else:
+                transcription_error = "No speech detected in video and no master script was provided."
         except Exception as exc:
             print(f"[Worker 01 Multimodal Fallback]: {exc}")
             transcription_error = str(exc)
-    elif script_text.strip():
-        detected_dialogue = script_text.strip()
-        source_used = "master_script_fallback (gemini_not_configured)"
     else:
-        transcription_error = "Gemini is not configured; provide GEMINI_API_KEY to transcribe video dialogue."
+        transcription_error = "Gemini is not configured and no master script was provided; nothing to transcribe or translate."
 
-    if not detected_dialogue and script_text.strip():
-        detected_dialogue = script_text.strip()
-        source_used = "master_script_fallback"
+    client = genai.Client(api_key=api_key) if genai and api_key else None
+
+    async def _translate_one(language: str) -> Tuple[str, str, Optional[str]]:
+        """Returns (language, translated_text, error_or_None)."""
+        if not (client and detected_dialogue):
+            return language, "", None
+        try:
+            translation_prompt = (
+                f"Translate the following movie dialogue into natural, idiomatic {language}. "
+                f"Return only the translated text:\n\n{detected_dialogue}"
+            )
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                contents=translation_prompt,
+            )
+            return language, (response.text or "").strip() or detected_dialogue, None
+        except Exception as exc:
+            # Same graceful degradation as a successful-but-empty response
+            # above — without this, a transient Gemini error (rate limit,
+            # safety-filter block, etc.) leaves this language with no
+            # dialogue at all instead of falling back to the source text.
+            return language, detected_dialogue, str(exc)
+
+    # One Gemini call per language, independent of each other — run
+    # concurrently instead of awaiting them one at a time.
+    translation_results = await asyncio.gather(
+        *(_translate_one(language) for language in target_languages)
+    )
 
     localized_dialogues = {}
     subtitle_files = {}
-    client = genai.Client(api_key=api_key) if genai and api_key else None
-
-    for language in target_languages:
-        translated_text = ""
-        if client and detected_dialogue:
-            try:
-                translation_prompt = (
-                    f"Translate the following movie dialogue into natural, idiomatic {language}. "
-                    f"Return only the translated text:\n\n{detected_dialogue}"
-                )
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-                    contents=translation_prompt,
-                )
-                translated_text = (response.text or "").strip() or detected_dialogue
-            except Exception as exc:
-                print(f"[Worker 01 Translation Fallback ({language})]: {exc}")
-                transcription_error = transcription_error or str(exc)
-                # Same graceful degradation as a successful-but-empty response
-                # above — without this, a transient Gemini error (rate limit,
-                # safety-filter block, etc.) leaves this language with no
-                # dialogue at all instead of falling back to the source text.
-                translated_text = detected_dialogue
-
+    for language, translated_text, error in translation_results:
+        if error:
+            print(f"[Worker 01 Translation Fallback ({language})]: {error}")
+            transcription_error = transcription_error or error
         localized_dialogues[language] = translated_text
         if translated_text:
             subtitle_files[language] = generate_srt_file(title, language, translated_text)
@@ -182,21 +189,32 @@ async def sound_stage_dubbing_worker(
 ) -> DepartmentOutput:
     """Worker 2: Generate downloadable localized MP3 dubbed-audio tracks."""
     start_time = time.time()
-    audio_tracks = {}
-    audio_errors = {}
 
-    for language, dialogue in localized_dialogues.items():
+    async def _synthesize_one(language: str, dialogue: str) -> Tuple[str, Optional[str], Optional[str]]:
+        """Returns (language, audio_path_or_None, error_or_None)."""
         if not dialogue:
-            audio_errors[language] = "No localized dialogue was available for synthesis."
-            continue
+            return language, None, "No localized dialogue was available for synthesis."
         try:
-            audio_tracks[language] = await asyncio.to_thread(
-                generate_dubbed_audio_file, title, language, dialogue
-            )
+            path = await asyncio.to_thread(generate_dubbed_audio_file, title, language, dialogue)
+            return language, path, None
         except Exception as exc:
             print(f"[Worker 02 Dubbing Fallback ({language})]: {exc}")
-            audio_errors[language] = str(exc)
-    
+            return language, None, str(exc)
+
+    # One Cloud TTS call per language — independent, so run concurrently
+    # instead of synthesizing one voice track at a time.
+    synthesis_results = await asyncio.gather(
+        *(_synthesize_one(language, dialogue) for language, dialogue in localized_dialogues.items())
+    )
+
+    audio_tracks = {}
+    audio_errors = {}
+    for language, path, error in synthesis_results:
+        if path:
+            audio_tracks[language] = path
+        else:
+            audio_errors[language] = error
+
     return DepartmentOutput(
         worker_id="worker_02",
         department_name="Sound Stage & Dubbing Lead",
@@ -227,27 +245,51 @@ async def smart_reframing_vfx_worker(video_url: str, platforms: List[str]) -> De
         execution_time_seconds=round(time.time() - start_time, 2)
     )
 
+# Regional classification boards to explicitly steer Parallel's research
+# toward, per target language — without this the task prompt only names the
+# language/region generically, leaving the model to guess which board's
+# guidelines actually apply.
+REGIONAL_RATING_BOARDS = {
+    "English": "MPAA (USA) and BBFC (UK)",
+    "Japanese": "CERO and Eirin (Japan)",
+    "Spanish": "ICAA (Spain)",
+    "French": "CNC classification commission (France)",
+    "German": "FSK (Germany)",
+}
+
+
 async def global_standards_compliance_worker(script_text: str, target_languages: List[str]) -> DepartmentOutput:
     """Worker 4: Global Standards & Compliance Guardian (Live Parallel Task API)."""
     start_time = time.time()
     parallel_interaction_id = "local_mock_mode"
+    parallel_run_id = "local_mock_mode"
     compliance_checks = ["Clear for PG-13 release", "No regional trademark violations flagged"]
     live_web_context = "No live API key supplied; utilizing local compliance cache."
-    
+
     if parallel_client:
         try:
+            board_hints = [
+                f"{language}: {REGIONAL_RATING_BOARDS[language]}"
+                for language in target_languages
+                if language in REGIONAL_RATING_BOARDS
+            ]
+            board_hint_clause = (
+                f" Specifically check guidelines from: {'; '.join(board_hints)}." if board_hints else ""
+            )
             # Query Parallel's live Task API for open-web rating/censorship rules
             task_prompt = (
                 f"Analyze current film release rating compliance, censorship guidelines, "
-                f"and cultural sensitivities for target regions: {', '.join(target_languages)} "
-                f"given the script context: '{script_text[:100]}...'"
+                f"and cultural sensitivities for target regions: {', '.join(target_languages)}."
+                f"{board_hint_clause} "
+                f"Given the script context: '{script_text[:100]}...'"
             )
             task_res = await parallel_client.task_run.create(
                 input=task_prompt,
                 processor="base"
             )
             parallel_interaction_id = getattr(task_res, "interaction_id", "live_task_active")
-            live_web_context = f"Live web analysis executed via Parallel API (ID: {parallel_interaction_id})."
+            parallel_run_id = getattr(task_res, "run_id", parallel_interaction_id)
+            live_web_context = f"Live web analysis executed via Parallel API (Run ID: {parallel_run_id})."
             compliance_checks.append("Live Parallel web research completed successfully.")
         except Exception as e:
             compliance_checks.append(f"Parallel API call note: {str(e)}")
@@ -259,6 +301,7 @@ async def global_standards_compliance_worker(script_text: str, target_languages:
         status="SUCCESS",
         data={
             "parallel_interaction_id": parallel_interaction_id,
+            "parallel_run_id": parallel_run_id,
             "compliance_checks": compliance_checks,
             "live_web_context": live_web_context
         },

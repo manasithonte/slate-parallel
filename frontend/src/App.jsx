@@ -20,6 +20,7 @@ import {
 
 const RENDER_POLL_INTERVAL_MS = 5000;
 const RENDER_ACTIVE_STATUSES = new Set(["PENDING", "SUBMITTED"]);
+const RENDER_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "NOT_CONFIGURED"]);
 const HEALTH_POLL_INTERVAL_MS = 15000;
 
 const API_BASE_URL = "http://127.0.0.1:8000";
@@ -42,9 +43,9 @@ const LANG_VOICE_CODES = {
 
 export default function App() {
   const [formData, setFormData] = useState({
-    title: "Inception 2: Teaser Cut",
-    script_text: "We have to venture into the subconscious mind before the collapse begins.",
-    video_url: "https://vjs.zencdn.net/v/oceans.mp4",
+    title: "",
+    script_text: "",
+    video_url: "",
   });
 
   const [selectedDubLanguages, setSelectedDubLanguages] = useState(["Japanese", "Spanish"]);
@@ -113,6 +114,23 @@ export default function App() {
   const [renderJob, setRenderJob] = useState(null);
   const [renderSubmitting, setRenderSubmitting] = useState(false);
 
+  // Elapsed-render-time tracking. Transcoder's Job API exposes no progress
+  // percentage (only PENDING/SUBMITTED/SUCCEEDED/FAILED), so "time taken" is
+  // measured client-side: created_at from the server, and a completion
+  // timestamp captured at the exact moment a fetch response first shows a
+  // terminal overall status (set right where that response is handled,
+  // not derived reactively in an effect — the best precision available
+  // without the backend recording its own end time).
+  const [renderCompletedAtMs, setRenderCompletedAtMs] = useState(null);
+  const [renderNowTick, setRenderNowTick] = useState(() => Date.now());
+
+  const applyRenderJobUpdate = (data) => {
+    setRenderJob(data);
+    if (!RENDER_ACTIVE_STATUSES.has(data.overall_status)) {
+      setRenderCompletedAtMs(Date.now());
+    }
+  };
+
   useEffect(() => {
     if (!renderJob || !RENDER_ACTIVE_STATUSES.has(renderJob.overall_status)) return;
 
@@ -121,7 +139,7 @@ export default function App() {
         const res = await fetch(`${API_BASE_URL}/api/v1/render-status/${renderJob.render_job_id}`);
         if (!res.ok) return;
         const data = await res.json();
-        setRenderJob(data);
+        applyRenderJobUpdate(data);
       } catch {
         // transient network error; next poll tick will retry
       }
@@ -130,9 +148,24 @@ export default function App() {
     return () => clearInterval(intervalId);
   }, [renderJob]);
 
+  useEffect(() => {
+    if (!renderJob || !RENDER_ACTIVE_STATUSES.has(renderJob.overall_status)) return;
+    const intervalId = setInterval(() => setRenderNowTick(Date.now()), 1000);
+    return () => clearInterval(intervalId);
+  }, [renderJob]);
+
+  const formatElapsed = (ms) => {
+    const totalSeconds = Math.max(0, ms / 1000);
+    if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = Math.round(totalSeconds % 60);
+    return `${minutes}m ${seconds}s`;
+  };
+
   const handleAssembleFinal = async () => {
     setRenderSubmitting(true);
     setRenderJob(null);
+    setRenderCompletedAtMs(null);
 
     const payload = {
       title: formData.title,
@@ -159,7 +192,7 @@ export default function App() {
       });
       if (!res.ok) throw new Error(`HTTP error ${res.status}`);
       const data = await res.json();
-      setRenderJob(data);
+      applyRenderJobUpdate(data);
     } catch (err) {
       alert("Final Assembly Error: " + err.message);
     } finally {
@@ -335,8 +368,9 @@ export default function App() {
                   type="text"
                   value={formData.title}
                   onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+                  placeholder="e.g. Inception 2: Teaser Cut"
                   required
-                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm focus:border-indigo-500 text-white"
+                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm focus:border-indigo-500 text-white placeholder:text-slate-600"
                 />
               </div>
 
@@ -346,7 +380,8 @@ export default function App() {
                   rows="3"
                   value={formData.script_text}
                   onChange={(e) => setFormData({ ...formData, script_text: e.target.value })}
-                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm focus:border-indigo-500 text-white resize-none"
+                  placeholder="e.g. We have to venture into the subconscious mind before the collapse begins."
+                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm focus:border-indigo-500 text-white placeholder:text-slate-600 resize-none"
                 />
               </div>
 
@@ -356,8 +391,9 @@ export default function App() {
                   type="url"
                   value={formData.video_url}
                   onChange={(e) => setFormData({ ...formData, video_url: e.target.value })}
+                  placeholder="e.g. https://vjs.zencdn.net/v/oceans.mp4"
                   required
-                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm text-slate-300"
+                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm text-slate-300 placeholder:text-slate-600"
                 />
               </div>
 
@@ -444,32 +480,60 @@ export default function App() {
             </form>
           </div>
 
-          {/* Performance Benchmark Card */}
-          {pipelineData && (
+          {/* Performance Benchmark Card — every number here is derived from
+              the real per-worker execution_time_seconds already returned by
+              the API (the same values shown on each worker card below), not
+              a fabricated placeholder.
+
+              Scoped to the fan-out stage specifically (workers 01/03/04 run
+              concurrently, 02 depends on 01 and runs after), excluding the
+              orchestrator's Gemini synthesis step that follows fan-in —
+              that step is constant regardless of how the workers themselves
+              executed, so mixing it into only one side of the comparison
+              would distort it (confirmed against a real run: total
+              pipeline_runtime_seconds includes ~10s of synthesis overhead
+              that has nothing to do with worker concurrency). */}
+          {pipelineData && (() => {
+            const rawWorkers = pipelineData.master_release_package?.raw_department_data || [];
+            const timeOf = (id) => rawWorkers.find(w => w.worker_id === id)?.execution_time_seconds || 0;
+            const w01 = timeOf('worker_01'), w02 = timeOf('worker_02'), w03 = timeOf('worker_03'), w04 = timeOf('worker_04');
+
+            const actualFanOutSeconds = Math.max(w01, w03, w04) + w02; // 01/03/04 concurrent, then 02
+            const estimatedSequentialSeconds = w01 + w02 + w03 + w04; // same 4 calls, one after another
+            const speedupMultiplier = actualFanOutSeconds > 0 ? estimatedSequentialSeconds / actualFanOutSeconds : 1;
+            const showSpeedupBadge = speedupMultiplier > 1.05; // guard against noise on trivially fast runs
+
+            return (
             <div className="bg-slate-900/90 border border-indigo-900/40 rounded-2xl p-5 shadow-lg space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
                   <Zap className="w-3.5 h-3.5 text-amber-400" /> Concurrency Benchmark
                 </span>
-                <span className="text-xs font-semibold text-emerald-400 bg-emerald-950 border border-emerald-800 px-2 py-0.5 rounded-full">
-                  &gt;2× Speedup
-                </span>
+                {showSpeedupBadge && (
+                  <span className="text-xs font-semibold text-emerald-400 bg-emerald-950 border border-emerald-800 px-2 py-0.5 rounded-full">
+                    {speedupMultiplier.toFixed(1)}× Speedup
+                  </span>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3">
-                <div className="p-3 bg-slate-950 rounded-xl border border-slate-800">
+                <div className="p-3 bg-slate-950 rounded-xl border border-slate-800" title="max(worker_01, worker_03, worker_04) + worker_02 — the 4 workers' own measured times, combined the way they actually ran">
                   <p className="text-xs text-slate-400">Parallel Fan-Out</p>
                   <p className="text-2xl font-bold text-emerald-400 mt-0.5">
-                    {pipelineData.pipeline_runtime_seconds}s
+                    {actualFanOutSeconds.toFixed(2)}s
                   </p>
                 </div>
-                <div className="p-3 bg-slate-950 rounded-xl border border-slate-800">
+                <div className="p-3 bg-slate-950 rounded-xl border border-slate-800" title="worker_01 + worker_02 + worker_03 + worker_04 — the same measured times, summed as if run one after another">
                   <p className="text-xs text-slate-400">Est. Sequential</p>
-                  <p className="text-2xl font-bold text-slate-500 mt-0.5">1.20s</p>
+                  <p className="text-2xl font-bold text-slate-500 mt-0.5">{estimatedSequentialSeconds.toFixed(2)}s</p>
                 </div>
               </div>
+              <p className="text-[10px] text-slate-600">
+                Fan-out stage only ({pipelineData.pipeline_runtime_seconds}s total pipeline, including AI synthesis)
+              </p>
             </div>
-          )}
+            );
+          })()}
         </div>
 
         {/* Right: Worker Cards & Live Media Deliverables */}
@@ -707,11 +771,36 @@ export default function App() {
                     <span>Render Final Video</span>
                   </button>
 
-                  {renderJob && (
+                  {renderJob && (() => {
+                    const isActive = RENDER_ACTIVE_STATUSES.has(renderJob.overall_status);
+                    const completedCount = renderJob.outputs.filter(o => RENDER_TERMINAL_STATUSES.has(o.status)).length;
+                    const totalCount = renderJob.outputs.length;
+                    const progressPercent = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 0;
+                    const elapsedMs = (isActive ? renderNowTick : (renderCompletedAtMs || renderNowTick)) - renderJob.created_at * 1000;
+
+                    return (
                     <div className="space-y-2">
-                      <p className="text-[10px] uppercase tracking-wider text-slate-500">
-                        Render Job {renderJob.render_job_id.slice(0, 8)} — {renderJob.overall_status}
-                      </p>
+                      <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-slate-500">
+                        <span>Render Job {renderJob.render_job_id.slice(0, 8)} — {renderJob.overall_status}</span>
+                        <span className="font-mono normal-case text-slate-400">
+                          {isActive ? `⏱ ${formatElapsed(elapsedMs)} elapsed` : `Done in ${formatElapsed(elapsedMs)}`}
+                        </span>
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all duration-500 ${
+                              renderJob.overall_status === 'FAILED' ? 'bg-rose-500' : 'bg-violet-500'
+                            }`}
+                            style={{ width: `${progressPercent}%` }}
+                          />
+                        </div>
+                        <p className="text-[10px] text-slate-500">
+                          {completedCount} of {totalCount} render{totalCount !== 1 ? 's' : ''} complete
+                        </p>
+                      </div>
+
                       {renderJob.outputs.map((output) => (
                         <div
                           key={`${output.platform}-${output.dub_language}-${output.subtitle_language}`}
@@ -747,7 +836,8 @@ export default function App() {
                         </div>
                       ))}
                     </div>
-                  )}
+                    );
+                  })()}
                 </div>
               </div>
 
@@ -779,30 +869,44 @@ export default function App() {
                   );
                 })}
 
-                <button
-                  disabled={!workerFourData}
-                  onClick={() => triggerDownload(
-                    `${formData.title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_compliance_certificate.txt`,
-                    `========================================\n` +
-                    `SLATEPARALLEL COMPLIANCE AUDIT CERTIFICATE\n` +
-                    `Project: ${formData.title}\n` +
-                    `Status: ${pipelineData?.master_release_package?.gemini_director_report?.status || "APPROVED"}\n` +
-                    `Parallel Interaction ID: ${workerFourData?.parallel_interaction_id || "n/a"}\n` +
-                    `Live Web Context: ${workerFourData?.live_web_context || "n/a"}\n` +
-                    `Compliance Checks:\n${(workerFourData?.compliance_checks || []).map(c => ` - ${c}`).join("\n")}\n` +
-                    `========================================`
-                  )}
-                  className="p-3 bg-slate-950 hover:bg-slate-900 border border-slate-800 hover:border-emerald-500/60 rounded-xl flex items-center justify-between transition text-left disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <FileCheck className="w-4 h-4 text-emerald-400" />
-                    <div>
-                      <p className="text-xs font-semibold text-slate-200">Compliance Certificate</p>
-                      <p className="text-[10px] text-emerald-400">Parallel Verified Audit</p>
-                    </div>
-                  </div>
-                  <Download className="w-4 h-4 text-slate-400" />
-                </button>
+                {(() => {
+                  const runId = workerFourData?.parallel_run_id;
+                  const isLiveVerified = Boolean(runId) && runId !== "local_mock_mode";
+                  const shortRunId = runId && runId.length > 18 ? `${runId.slice(0, 18)}…` : runId;
+
+                  return (
+                    <button
+                      disabled={!workerFourData}
+                      onClick={() => triggerDownload(
+                        `${formData.title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_compliance_certificate.txt`,
+                        `========================================\n` +
+                        `SLATEPARALLEL COMPLIANCE AUDIT CERTIFICATE\n` +
+                        `Project: ${formData.title}\n` +
+                        `Status: ${pipelineData?.master_release_package?.gemini_director_report?.status || "APPROVED"}\n` +
+                        `Parallel Task Run ID: ${workerFourData?.parallel_run_id || "n/a"}\n` +
+                        `Parallel Interaction ID: ${workerFourData?.parallel_interaction_id || "n/a"}\n` +
+                        `Live Web Context: ${workerFourData?.live_web_context || "n/a"}\n` +
+                        `Compliance Checks:\n${(workerFourData?.compliance_checks || []).map(c => ` - ${c}`).join("\n")}\n` +
+                        `========================================`
+                      )}
+                      className="p-3 bg-slate-950 hover:bg-slate-900 border border-slate-800 hover:border-emerald-500/60 rounded-xl flex items-center justify-between transition text-left disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <FileCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <div className="min-w-0">
+                          <p className="text-xs font-semibold text-slate-200">Compliance Certificate</p>
+                          <p
+                            className={`text-[10px] font-mono truncate ${isLiveVerified ? 'text-emerald-400' : 'text-slate-500'}`}
+                            title={isLiveVerified ? `Full Parallel Task Run ID: ${runId}` : 'No live API key supplied; using local compliance cache'}
+                          >
+                            {isLiveVerified ? `✓ Verified via Parallel Task ${shortRunId}` : 'Local mock mode — not live-verified'}
+                          </p>
+                        </div>
+                      </div>
+                      <Download className="w-4 h-4 text-slate-400 shrink-0" />
+                    </button>
+                  );
+                })()}
               </div>
 
             </div>
@@ -848,9 +952,12 @@ function summarizeWorkerThree(data) {
 function summarizeWorkerFour(data) {
   const checks = data.compliance_checks || [];
   const failedNote = checks.find(c => /error|fail/i.test(c));
+  const runId = data.parallel_run_id;
+  const isLiveVerified = Boolean(runId) && runId !== "local_mock_mode";
   return {
     text: `${checks.length} compliance check${checks.length !== 1 ? 's' : ''}${checks[0] ? `: ${checks[0]}` : ''}`,
     warning: failedNote && failedNote !== checks[0] ? failedNote : null,
+    verified: isLiveVerified ? `Verified via Parallel Task ${runId}` : null,
   };
 }
 
@@ -884,6 +991,11 @@ function WorkerCard({ icon, title, state, placeholder, summarize }) {
         {summary?.warning && (
           <p className="text-[10px] text-amber-400 mt-1 line-clamp-1" title={summary.warning}>
             ⚠ {summary.warning}
+          </p>
+        )}
+        {summary?.verified && (
+          <p className="text-[10px] text-emerald-400 font-mono mt-1 line-clamp-1" title={summary.verified}>
+            ✓ {summary.verified}
           </p>
         )}
       </div>

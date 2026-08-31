@@ -58,11 +58,27 @@ def _get_client():
     return _transcoder_client
 
 
+def _crop_pixels_for_platform(platform: str, width: int, height: int) -> "transcoder_v1.types.PreprocessingConfig.Crop":
+    """Translate the same aspect-ratio rules used for the ffmpeg crop filter
+    (see get_crop_parameters in media_engine.py) into exact pixel offsets —
+    used only when Transcoder itself performs the crop, i.e. no subtitles
+    are being burned in for this platform so no local ffmpeg pass ran."""
+    crop = get_crop_parameters(platform)
+    if crop["aspect_ratio"] == "9:16":
+        target_width = int(height * 9 / 16)
+        side = max(0, (width - target_width) // 2)
+        return transcoder_v1.types.PreprocessingConfig.Crop(left_pixels=side, right_pixels=side)
+    if crop["aspect_ratio"] == "1:1":
+        side = max(0, (width - height) // 2)
+        return transcoder_v1.types.PreprocessingConfig.Crop(left_pixels=side, right_pixels=side)
+    return transcoder_v1.types.PreprocessingConfig.Crop()
+
+
 def _probe_video_dimensions(local_path: str) -> Tuple[int, int, float]:
-    """Read source width/height/duration via ffprobe. Width/height are no
-    longer used for crop math (crop now happens locally via ffmpeg, keyed
-    off the platform's own aspect ratio — see crop_and_burn_subtitles in
-    media_engine.py) but duration still drives the EditAtom trim below."""
+    """Read source width/height/duration via ffprobe. Width/height feed
+    Transcoder's own crop for platforms with no subtitles to burn (see
+    _crop_pixels_for_platform); duration always drives the EditAtom trim
+    below regardless of which crop path a platform takes."""
     result = subprocess.run(
         [
             "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -136,6 +152,7 @@ def _build_job(
     video_duration: float,
     audio_gcs_uri: Optional[str],
     audio_duration: Optional[float],
+    raw_video_dims: Optional[Tuple[int, int]] = None,
 ) -> "transcoder_v1.types.Job":
     crop = get_crop_parameters(platform)
     out_width, out_height = crop["output_width"], crop["output_height"]
@@ -143,10 +160,20 @@ def _build_job(
     sub_tag = subtitle_language.lower() if subtitle_language else "nosubs"
     output_filename = f"{crop['output_tag']}_dub-{dub_tag}_subs-{sub_tag}.mp4"
 
-    # No PreprocessingConfig.Crop here: video_gcs_uri already points at a
-    # locally cropped/scaled(/subtitled) file (see _run_render_pipeline),
-    # so this job only needs to re-encode and mux in the dub track.
-    inputs = [transcoder_v1.types.Input(key="video-input", uri=video_gcs_uri)]
+    video_input_kwargs = {"key": "video-input", "uri": video_gcs_uri}
+    if raw_video_dims is not None:
+        # No subtitles to burn for this platform, so no local ffmpeg pass
+        # ran — video_gcs_uri is still the raw, un-cropped source. Let
+        # Transcoder do the crop itself here rather than paying for a
+        # redundant local transcode just to hand it an already-cropped file.
+        width, height = raw_video_dims
+        video_input_kwargs["preprocessing_config"] = transcoder_v1.types.PreprocessingConfig(
+            crop=_crop_pixels_for_platform(platform, width, height)
+        )
+    # Otherwise video_gcs_uri already points at a locally cropped/scaled/
+    # subtitled file (see _run_render_pipeline), so no crop is needed here —
+    # this job only re-encodes and mux in the dub track.
+    inputs = [transcoder_v1.types.Input(**video_input_kwargs)]
     atom_inputs = ["video-input"]
 
     audio_stream_kwargs = {"codec": "aac", "bitrate_bps": 128000}
@@ -225,12 +252,14 @@ async def _submit_and_poll(
     dub_language: Optional[str], subtitle_language: Optional[str],
     video_gcs_uri: str, video_duration: float,
     audio_gcs_uri: Optional[str], audio_duration: Optional[float],
+    raw_video_dims: Optional[Tuple[int, int]] = None,
 ):
     output = RENDER_JOBS[render_job_id].outputs[index]
     try:
         job, output_filename = _build_job(
             render_job_id, platform, dub_language, subtitle_language,
             video_gcs_uri, video_duration, audio_gcs_uri, audio_duration,
+            raw_video_dims,
         )
         client = _get_client()
         parent = f"projects/{TRANSCODER_PROJECT}/locations/{TRANSCODER_LOCATION}"
@@ -269,7 +298,7 @@ async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
     render_job = RENDER_JOBS[render_job_id]
     try:
         local_source_path = await asyncio.to_thread(_download_source_to_local, request.video_url)
-        _, _, video_duration = await asyncio.to_thread(_probe_video_dimensions, local_source_path)
+        width, height, video_duration = await asyncio.to_thread(_probe_video_dimensions, local_source_path)
     except Exception as exc:
         for output in render_job.outputs:
             output.status = RenderJobStatus.FAILED
@@ -278,43 +307,81 @@ async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
         return
 
     platform_video_uris: Dict[str, str] = {}
+    platform_needs_transcoder_crop: Dict[str, bool] = {}
     dub_audio_uris: Dict[str, Optional[str]] = {}
     dub_audio_durations: Dict[str, Optional[float]] = {}
     rendered_local_paths = []
 
+    # Shared raw-source upload for platforms with no subtitles to burn —
+    # uploaded at most once and reused, guarded against a race between
+    # concurrently-running platforms both wanting it at the same time.
+    raw_source_gcs_uri: Optional[str] = None
+    raw_source_lock = asyncio.Lock()
+
+    async def _get_raw_source_uri() -> str:
+        nonlocal raw_source_gcs_uri
+        async with raw_source_lock:
+            if raw_source_gcs_uri is None:
+                raw_source_gcs_uri = await asyncio.to_thread(
+                    gcs_engine.upload_to_gcs, local_source_path,
+                    f"renders/{render_job_id}/video_source_raw.mp4",
+                )
+        return raw_source_gcs_uri
+
+    async def _stage_platform_video(platform: str, rendition) -> None:
+        subtitle_language = rendition.subtitle_language
+        srt_path = request.subtitle_files.get(subtitle_language) if subtitle_language else None
+        if srt_path and not os.path.exists(srt_path):
+            srt_path = None
+
+        if not srt_path:
+            # No subtitles to burn — skip the local ffmpeg crop/scale pass
+            # entirely (it would just be a redundant transcode ahead of
+            # Transcoder's own) and let Transcoder crop the raw source.
+            platform_needs_transcoder_crop[platform] = True
+            platform_video_uris[platform] = await _get_raw_source_uri()
+            return
+
+        platform_needs_transcoder_crop[platform] = False
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as rendered_file:
+            rendered_path = rendered_file.name
+        # Track for cleanup immediately, before the risky ffmpeg/upload work,
+        # so a sibling platform's failure (which cancels this task mid-flight
+        # under asyncio.gather) doesn't leak this temp file.
+        rendered_local_paths.append(rendered_path)
+        await asyncio.to_thread(
+            crop_and_burn_subtitles, local_source_path, platform, srt_path, rendered_path
+        )
+        crop_tag = get_crop_parameters(platform)["output_tag"]
+        platform_video_uris[platform] = await asyncio.to_thread(
+            gcs_engine.upload_to_gcs, rendered_path,
+            f"renders/{render_job_id}/video_{crop_tag}_{(subtitle_language or 'nosubs').lower()}.mp4",
+        )
+
+    async def _stage_dub_audio(dub_language: str) -> None:
+        audio_path = request.dubbed_tracks.get(dub_language)
+        if not audio_path:
+            dub_audio_uris[dub_language] = None
+            dub_audio_durations[dub_language] = None
+            return
+        dub_audio_durations[dub_language] = await asyncio.to_thread(_probe_audio_duration, audio_path)
+        dub_audio_uris[dub_language] = await asyncio.to_thread(
+            gcs_engine.upload_to_gcs, audio_path,
+            f"renders/{render_job_id}/audio_{dub_language.lower()}.mp3"
+        )
+
+    # Each platform's crop/subtitle-burn/upload, and each unique dub
+    # language's probe/upload, are fully independent — run them all
+    # concurrently instead of one platform at a time before any Transcoder
+    # job is even submitted.
+    unique_dub_languages = {
+        rendition.dub_language for rendition in request.platform_renditions.values() if rendition.dub_language
+    }
     try:
-        for platform, rendition in request.platform_renditions.items():
-            subtitle_language = rendition.subtitle_language
-            srt_path = request.subtitle_files.get(subtitle_language) if subtitle_language else None
-            if srt_path and not os.path.exists(srt_path):
-                srt_path = None
-
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as rendered_file:
-                rendered_path = rendered_file.name
-            await asyncio.to_thread(
-                crop_and_burn_subtitles, local_source_path, platform, srt_path, rendered_path
-            )
-            rendered_local_paths.append(rendered_path)
-            crop_tag = get_crop_parameters(platform)["output_tag"]
-            platform_video_uris[platform] = await asyncio.to_thread(
-                gcs_engine.upload_to_gcs, rendered_path,
-                f"renders/{render_job_id}/video_{crop_tag}_{(subtitle_language or 'nosubs').lower()}.mp4",
-            )
-
-            dub_language = rendition.dub_language
-            if dub_language and dub_language not in dub_audio_uris:
-                audio_path = request.dubbed_tracks.get(dub_language)
-                if audio_path:
-                    dub_audio_durations[dub_language] = await asyncio.to_thread(
-                        _probe_audio_duration, audio_path
-                    )
-                    dub_audio_uris[dub_language] = await asyncio.to_thread(
-                        gcs_engine.upload_to_gcs, audio_path,
-                        f"renders/{render_job_id}/audio_{dub_language.lower()}.mp3"
-                    )
-                else:
-                    dub_audio_uris[dub_language] = None
-                    dub_audio_durations[dub_language] = None
+        await asyncio.gather(
+            *(_stage_platform_video(platform, rendition) for platform, rendition in request.platform_renditions.items()),
+            *(_stage_dub_audio(language) for language in unique_dub_languages),
+        )
     except Exception as exc:
         for output in render_job.outputs:
             output.status = RenderJobStatus.FAILED
@@ -331,9 +398,11 @@ async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
         dub_language = rendition.dub_language
         audio_gcs_uri = dub_audio_uris.get(dub_language) if dub_language else None
         audio_duration = dub_audio_durations.get(dub_language) if dub_language else None
+        raw_video_dims = (width, height) if platform_needs_transcoder_crop.get(platform) else None
         tasks.append(_submit_and_poll(
             render_job_id, index, platform, dub_language, rendition.subtitle_language,
             platform_video_uris[platform], video_duration, audio_gcs_uri, audio_duration,
+            raw_video_dims,
         ))
 
     await asyncio.gather(*tasks)
