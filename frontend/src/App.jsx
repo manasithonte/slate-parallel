@@ -17,7 +17,7 @@ const RENDER_POLL_INTERVAL_MS = 5000;
 const RENDER_ACTIVE_STATUSES = new Set(["PENDING", "SUBMITTED"]);
 const RENDER_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "NOT_CONFIGURED"]);
 
-const API_BASE_URL = "http://127.0.0.1:8000";
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 
 const AVAILABLE_LANGUAGES = ["English", "Japanese", "Spanish", "French", "German"];
 const AVAILABLE_PLATFORMS = ["TikTok (9:16)", "Instagram Post (1:1)"];
@@ -48,8 +48,7 @@ const PILL_UNSELECTED = 'bg-white border-stone-300 text-stone-500 hover:border-s
 
 function SectionLabel({ children }) {
   return (
-    <div className="flex items-center gap-2 mb-2">
-      <span className="w-3 h-3 border border-stone-400 rounded-[3px] shrink-0" />
+    <div className="mb-2">
       <span className="text-[11px] font-semibold tracking-widest text-stone-500 uppercase">{children}</span>
     </div>
   );
@@ -79,9 +78,9 @@ export default function App() {
     video_url: "",
   });
 
-  const [selectedDubLanguages, setSelectedDubLanguages] = useState(["Japanese", "Spanish"]);
-  const [selectedSubtitleLanguages, setSelectedSubtitleLanguages] = useState(["Japanese", "Spanish", "French"]);
-  const [selectedPlatforms, setSelectedPlatforms] = useState(["TikTok (9:16)", "Instagram Post (1:1)"]);
+  const [selectedDubLanguages, setSelectedDubLanguages] = useState([]);
+  const [selectedSubtitleLanguages, setSelectedSubtitleLanguages] = useState([]);
+  const [selectedPlatforms, setSelectedPlatforms] = useState([]);
 
   // Per-platform choice of which previously-selected dub/subtitle language to
   // actually bake into that platform's final render. Only holds explicit user
@@ -476,11 +475,10 @@ export default function App() {
                       type="button"
                       key={plat}
                       onClick={() => togglePlatform(plat)}
-                      className={`text-xs px-2.5 py-1 rounded-lg border transition flex items-center gap-1.5 ${
+                      className={`text-xs px-2.5 py-1 rounded-lg border transition ${
                         selectedPlatforms.includes(plat) ? PILL_COLORS.violet : PILL_UNSELECTED
                       }`}
                     >
-                      <span className={`w-2 h-2 rounded-[2px] border ${selectedPlatforms.includes(plat) ? 'border-orange-500' : 'border-stone-400'}`} />
                       {plat}
                     </button>
                   ))}
