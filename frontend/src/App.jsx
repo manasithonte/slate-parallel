@@ -1,19 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  Clapperboard,
   Play,
   Loader2,
-  CheckCircle2,
-  FileText,
-  Mic,
-  Crop,
-  ShieldCheck,
+  Square,
   Zap,
   Film,
-  Layers,
   Download,
   Volume2,
   Smartphone,
+  FileText,
   FileCheck,
   VolumeX
 } from 'lucide-react';
@@ -21,7 +16,6 @@ import {
 const RENDER_POLL_INTERVAL_MS = 5000;
 const RENDER_ACTIVE_STATUSES = new Set(["PENDING", "SUBMITTED"]);
 const RENDER_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "NOT_CONFIGURED"]);
-const HEALTH_POLL_INTERVAL_MS = 15000;
 
 const API_BASE_URL = "http://127.0.0.1:8000";
 
@@ -29,8 +23,8 @@ const AVAILABLE_LANGUAGES = ["English", "Japanese", "Spanish", "French", "German
 const AVAILABLE_PLATFORMS = ["TikTok (9:16)", "Instagram Post (1:1)"];
 
 const PLATFORM_FRAME_STYLES = {
-  "TikTok (9:16)": { label: "TikTok (9:16 Vertical Cut)", box: "w-32 h-56", border: "border-indigo-500/40" },
-  "Instagram Post (1:1)": { label: "Instagram (1:1 Square Cut)", box: "w-44 h-44", border: "border-violet-500/40" },
+  "TikTok (9:16)": { label: "TikTok (9:16 Vertical Cut)", box: "w-32 h-56", border: "border-orange-300" },
+  "Instagram Post (1:1)": { label: "Instagram (1:1 Square Cut)", box: "w-44 h-44", border: "border-orange-300" },
 };
 
 const LANG_VOICE_CODES = {
@@ -40,6 +34,43 @@ const LANG_VOICE_CODES = {
   French: 'fr-FR',
   German: 'de-DE'
 };
+
+// Selectable-pill color tokens per category — unselected pills share one
+// muted look; selected pills pick up an orange-family accent (all shades of
+// orange/amber, per category) so the same color language used on the
+// worker cards carries through to the form.
+const PILL_COLORS = {
+  cyan: 'bg-orange-50 border-orange-300 text-orange-700',
+  sky: 'bg-amber-50 border-amber-300 text-amber-700',
+  violet: 'bg-orange-50 border-orange-300 text-orange-700',
+};
+const PILL_UNSELECTED = 'bg-white border-stone-300 text-stone-500 hover:border-stone-400 hover:text-stone-700';
+
+function SectionLabel({ children }) {
+  return (
+    <div className="flex items-center gap-2 mb-2">
+      <span className="w-3 h-3 border border-stone-400 rounded-[3px] shrink-0" />
+      <span className="text-[11px] font-semibold tracking-widest text-stone-500 uppercase">{children}</span>
+    </div>
+  );
+}
+
+// Numbered circular step header — ties the form's three stages together
+// (1 Project details, 2 Languages, 3 Target platforms) the way the header
+// icon chips do for the right-hand cards.
+function StepHeader({ number, title, subtitle }) {
+  return (
+    <div className="flex items-center justify-between">
+      <div className="flex items-center gap-3">
+        <div className="w-7 h-7 rounded-full bg-orange-600 text-white text-xs font-bold flex items-center justify-center shrink-0">
+          {number}
+        </div>
+        <h2 className="text-sm font-bold text-stone-900">{title}</h2>
+      </div>
+      <span className="text-[11px] text-stone-400">{subtitle}</span>
+    </div>
+  );
+}
 
 export default function App() {
   const [formData, setFormData] = useState({
@@ -90,25 +121,6 @@ export default function App() {
     worker_04: { status: 'IDLE', time: null, data: null },
   });
 
-  // Header status badge — reflects the actual backend /health check, not a
-  // hardcoded claim, so it goes red the moment the API is unreachable.
-  const [apiStatus, setApiStatus] = useState('checking');
-
-  useEffect(() => {
-    let cancelled = false;
-    const checkHealth = async () => {
-      try {
-        const res = await fetch(`${API_BASE_URL}/health`);
-        if (!cancelled) setApiStatus(res.ok ? 'healthy' : 'unreachable');
-      } catch {
-        if (!cancelled) setApiStatus('unreachable');
-      }
-    };
-    checkHealth();
-    const intervalId = setInterval(checkHealth, HEALTH_POLL_INTERVAL_MS);
-    return () => { cancelled = true; clearInterval(intervalId); };
-  }, []);
-
   // Final-assembly (Transcoder) stage — additive, triggered manually after
   // the fan-out pipeline succeeds. See src/render_engine.py.
   const [renderJob, setRenderJob] = useState(null);
@@ -153,6 +165,19 @@ export default function App() {
     const intervalId = setInterval(() => setRenderNowTick(Date.now()), 1000);
     return () => clearInterval(intervalId);
   }, [renderJob]);
+
+  // Elapsed fan-out-pipeline timer — same client-side-ticking pattern as the
+  // render job above (the API only returns a final pipeline_runtime_seconds
+  // once the whole request resolves, so a live "Xs elapsed" while workers
+  // are still running has to be timed on the client).
+  const [pipelineStartMs, setPipelineStartMs] = useState(null);
+  const [pipelineNowTick, setPipelineNowTick] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!loading) return;
+    const intervalId = setInterval(() => setPipelineNowTick(Date.now()), 1000);
+    return () => clearInterval(intervalId);
+  }, [loading]);
 
   const formatElapsed = (ms) => {
     const totalSeconds = Math.max(0, ms / 1000);
@@ -261,6 +286,7 @@ export default function App() {
     e.preventDefault();
     setLoading(true);
     setPipelineData(null);
+    setPipelineStartMs(Date.now());
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;
@@ -312,40 +338,44 @@ export default function App() {
     }
   };
 
-  return (
-    <div className="min-h-screen bg-slate-950 bg-[radial-gradient(ellipse_80%_50%_at_50%_-10%,rgba(99,102,241,0.12),transparent)] text-slate-100 antialiased pb-20">
-      {/* Header */}
-      <header className="border-b border-slate-800 bg-slate-900/60 backdrop-blur sticky top-0 z-50">
-        <div className="max-w-[2400px] mx-auto px-6 lg:px-10 py-4 flex justify-between items-center">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-lg shadow-indigo-500/30">
-              <Film className="w-5 h-5" />
-            </div>
-            <div>
-              <h1 className="text-lg font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white via-slate-200 to-indigo-400">
-                SlateParallel
-              </h1>
-              <p className="text-xs text-slate-400">Autonomous Post-Production Studio Orchestrator</p>
-            </div>
-          </div>
+  const runningCount = Object.values(workerStates).filter(s => s.status === 'RUNNING').length;
+  const totalWorkerCount = Object.keys(workerStates).length;
+  const fanOutStateLabel = loading ? 'running' : pipelineData ? 'complete' : 'idle';
+  const pipelineElapsedMs = loading && pipelineStartMs ? (pipelineNowTick - pipelineStartMs) : null;
 
-          <span
-            title={`${API_BASE_URL}/health`}
-            className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium border ${
-              apiStatus === 'healthy'
-                ? 'bg-emerald-950 text-emerald-400 border-emerald-800'
-                : apiStatus === 'unreachable'
-                ? 'bg-rose-950 text-rose-400 border-rose-800'
-                : 'bg-slate-900 text-slate-400 border-slate-800'
-            }`}
-          >
-            <span className={`w-2 h-2 rounded-full ${
-              apiStatus === 'healthy' ? 'bg-emerald-400 animate-pulse' : apiStatus === 'unreachable' ? 'bg-rose-400' : 'bg-slate-500 animate-pulse'
-            }`}></span>
-            {apiStatus === 'healthy' ? 'API Live' : apiStatus === 'unreachable' ? 'API Unreachable' : 'Checking API…'}
-          </span>
+  return (
+    <div className="min-h-screen bg-[#FBF7EF] bg-[radial-gradient(ellipse_80%_50%_at_50%_-10%,rgba(6,182,212,0.08),transparent)] text-stone-900 antialiased pb-20">
+      {/* Header */}
+      <header className="border-b border-stone-200 bg-[#FBF7EF]/90 backdrop-blur sticky top-0 z-50">
+        <div className="max-w-[2400px] mx-auto px-6 lg:px-10 py-4 flex items-center">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-orange-600 flex items-center justify-center shadow-md shadow-orange-600/20 overflow-hidden">
+              <img src="/clapperboard.jpg" alt="SlateParallel" className="w-9 h-9 object-contain mix-blend-multiply" />
+            </div>
+            <h1 className="text-lg font-bold tracking-tight text-stone-900">
+              SlateParallel
+            </h1>
+          </div>
         </div>
       </header>
+
+      {/* Intro — a one-line explanation of what the app actually does,
+          since the header alone (name + tagline) doesn't say anything
+          about the pipeline itself to a first-time visitor. */}
+      <div className="max-w-[2400px] mx-auto px-6 lg:px-10 pt-10 pb-1">
+        <p className="text-[11px] font-bold tracking-[0.2em] text-orange-600 uppercase mb-2">
+          Agentic Post-Production Pipeline
+        </p>
+        <h2 className="text-3xl sm:text-4xl font-black tracking-tight leading-[1.15] text-stone-900">
+          Four agents walk into the edit bay.<br />
+          <span className="bg-clip-text text-transparent bg-gradient-to-r from-orange-600 via-orange-500 to-amber-500">
+            A global release walks out.
+          </span>
+        </h2>
+        <p className="text-base text-stone-600 max-w-2xl leading-relaxed mt-4">
+          <span className="font-semibold text-stone-800">Subtitles. Dubbing. Reframing. Compliance.</span> Four workers, one pass, running in parallel.
+        </p>
+      </div>
 
       {/* Main Grid — a fixed-width form column plus a right column that
           fills whatever space remains, so wide monitors don't just leave
@@ -355,120 +385,125 @@ export default function App() {
 
         {/* Left: Input Form */}
         <div className="space-y-6">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
-            <div className="flex items-center gap-2 mb-4 text-white font-semibold">
-              <Clapperboard className="w-5 h-5 text-indigo-400" />
-              <h2>New Media Release Job</h2>
-            </div>
+          <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm shadow-stone-200">
+            <form onSubmit={handleTriggerPipeline} className="space-y-5">
+              <StepHeader number={1} title="Project details" subtitle="Source + script" />
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-xs font-medium text-stone-500 mb-1">Project Title</label>
+                  <input
+                    type="text"
+                    value={formData.title}
+                    onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+                    placeholder="e.g. Inception 2: Teaser Cut"
+                    required
+                    className="w-full px-3.5 py-2.5 bg-white border border-stone-300 rounded-xl text-sm focus:border-orange-500 focus:ring-2 focus:ring-orange-100 outline-none text-stone-900 placeholder:text-stone-400 transition"
+                  />
+                </div>
 
-            <form onSubmit={handleTriggerPipeline} className="space-y-4">
-              <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1">Project Title</label>
-                <input
-                  type="text"
-                  value={formData.title}
-                  onChange={(e) => setFormData({ ...formData, title: e.target.value })}
-                  placeholder="e.g. Inception 2: Teaser Cut"
-                  required
-                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm focus:border-indigo-500 text-white placeholder:text-slate-600"
-                />
-              </div>
+                <div>
+                  <label className="block text-xs font-medium text-stone-500 mb-1">Master Script Dialogue</label>
+                  <textarea
+                    rows="3"
+                    value={formData.script_text}
+                    onChange={(e) => setFormData({ ...formData, script_text: e.target.value })}
+                    placeholder="e.g. We have to venture into the subconscious mind before the collapse begins."
+                    className="w-full px-3.5 py-2.5 bg-white border border-stone-300 rounded-xl text-sm focus:border-orange-500 focus:ring-2 focus:ring-orange-100 outline-none text-stone-900 placeholder:text-stone-400 resize-none transition"
+                  />
+                </div>
 
-              <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1">Master Script Dialogue</label>
-                <textarea
-                  rows="3"
-                  value={formData.script_text}
-                  onChange={(e) => setFormData({ ...formData, script_text: e.target.value })}
-                  placeholder="e.g. We have to venture into the subconscious mind before the collapse begins."
-                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm focus:border-indigo-500 text-white placeholder:text-slate-600 resize-none"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1">Source Video Asset URL</label>
-                <input
-                  type="url"
-                  value={formData.video_url}
-                  onChange={(e) => setFormData({ ...formData, video_url: e.target.value })}
-                  placeholder="e.g. https://vjs.zencdn.net/v/oceans.mp4"
-                  required
-                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm text-slate-300 placeholder:text-slate-600"
-                />
-              </div>
-
-              {/* Dubbing Languages */}
-              <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1.5">Dubbing Languages (Voice)</label>
-                <div className="flex flex-wrap gap-1.5">
-                  {AVAILABLE_LANGUAGES.map(lang => (
-                    <button
-                      type="button"
-                      key={lang}
-                      onClick={() => toggleDubLanguage(lang)}
-                      className={`text-xs px-2.5 py-1 rounded-lg border transition ${
-                        selectedDubLanguages.includes(lang)
-                          ? 'bg-indigo-600/30 text-indigo-300 border-indigo-500/60'
-                          : 'bg-slate-950 text-slate-500 border-slate-800'
-                      }`}
-                    >
-                      {selectedDubLanguages.includes(lang) && "✓ "}{lang}
-                    </button>
-                  ))}
+                <div>
+                  <label className="block text-xs font-medium text-stone-500 mb-1">Source Video Asset URL</label>
+                  <input
+                    type="url"
+                    value={formData.video_url}
+                    onChange={(e) => setFormData({ ...formData, video_url: e.target.value })}
+                    placeholder="e.g. https://vjs.zencdn.net/v/oceans.mp4"
+                    required
+                    className="w-full px-3.5 py-2.5 bg-white border border-stone-300 rounded-xl text-sm focus:border-orange-500 focus:ring-2 focus:ring-orange-100 outline-none text-stone-900 placeholder:text-stone-400 transition"
+                  />
                 </div>
               </div>
 
-              {/* Subtitle Languages */}
-              <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1.5">Subtitle Languages (Captions)</label>
-                <div className="flex flex-wrap gap-1.5">
-                  {AVAILABLE_LANGUAGES.map(lang => (
-                    <button
-                      type="button"
-                      key={lang}
-                      onClick={() => toggleSubtitleLanguage(lang)}
-                      className={`text-xs px-2.5 py-1 rounded-lg border transition ${
-                        selectedSubtitleLanguages.includes(lang)
-                          ? 'bg-sky-600/30 text-sky-300 border-sky-500/60'
-                          : 'bg-slate-950 text-slate-500 border-slate-800'
-                      }`}
-                    >
-                      {selectedSubtitleLanguages.includes(lang) && "✓ "}{lang}
-                    </button>
-                  ))}
+              <div className="border-t border-stone-200 pt-5 space-y-3">
+                <StepHeader number={2} title="Languages" subtitle="Dub and subtitle" />
+                <div className="grid grid-cols-2 gap-4">
+                  {/* Dubbing Languages */}
+                  <div>
+                    <SectionLabel>Dubbing</SectionLabel>
+                    <div className="flex flex-wrap gap-1.5">
+                      {AVAILABLE_LANGUAGES.map(lang => (
+                        <button
+                          type="button"
+                          key={lang}
+                          onClick={() => toggleDubLanguage(lang)}
+                          className={`text-xs px-2.5 py-1 rounded-lg border transition ${
+                            selectedDubLanguages.includes(lang) ? PILL_COLORS.cyan : PILL_UNSELECTED
+                          }`}
+                        >
+                          {lang}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Subtitle Languages */}
+                  <div>
+                    <SectionLabel>Subtitles</SectionLabel>
+                    <div className="flex flex-wrap gap-1.5">
+                      {AVAILABLE_LANGUAGES.map(lang => (
+                        <button
+                          type="button"
+                          key={lang}
+                          onClick={() => toggleSubtitleLanguage(lang)}
+                          className={`text-xs px-2.5 py-1 rounded-lg border transition ${
+                            selectedSubtitleLanguages.includes(lang) ? PILL_COLORS.sky : PILL_UNSELECTED
+                          }`}
+                        >
+                          {lang}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               </div>
 
-              {/* Target Platforms */}
-              <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1.5">Target Distribution Platforms</label>
+              <div className="border-t border-stone-200 pt-5 space-y-3">
+                <StepHeader number={3} title="Target platforms" subtitle="Output formats" />
                 <div className="flex flex-wrap gap-1.5">
                   {AVAILABLE_PLATFORMS.map(plat => (
                     <button
                       type="button"
                       key={plat}
                       onClick={() => togglePlatform(plat)}
-                      className={`text-xs px-2.5 py-1 rounded-lg border transition ${
-                        selectedPlatforms.includes(plat)
-                          ? 'bg-violet-600/30 text-violet-300 border-violet-500/60'
-                          : 'bg-slate-950 text-slate-500 border-slate-800'
+                      className={`text-xs px-2.5 py-1 rounded-lg border transition flex items-center gap-1.5 ${
+                        selectedPlatforms.includes(plat) ? PILL_COLORS.violet : PILL_UNSELECTED
                       }`}
                     >
-                      {selectedPlatforms.includes(plat) && "✓ "}{plat}
+                      <span className={`w-2 h-2 rounded-[2px] border ${selectedPlatforms.includes(plat) ? 'border-orange-500' : 'border-stone-400'}`} />
+                      {plat}
                     </button>
                   ))}
                 </div>
               </div>
 
+              <p className="text-center text-[11px] text-stone-400 pt-1">
+                {selectedDubLanguages.length} dub · {selectedSubtitleLanguages.length} subtitle language{selectedSubtitleLanguages.length !== 1 ? 's' : ''} · {selectedPlatforms.length} platform{selectedPlatforms.length !== 1 ? 's' : ''}
+              </p>
+
               <button
                 type="submit"
                 disabled={loading}
-                className="w-full mt-2 py-3 px-4 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-sm font-semibold text-white shadow-lg shadow-indigo-600/30 transition flex items-center justify-center gap-2 disabled:opacity-50"
+                className={`w-full py-3 px-4 rounded-xl text-sm font-semibold transition flex items-center justify-center gap-2 disabled:cursor-not-allowed ${
+                  loading
+                    ? 'bg-orange-50 border border-orange-300 text-orange-700'
+                    : 'bg-orange-600 hover:bg-orange-700 text-white shadow-md shadow-orange-600/20'
+                }`}
               >
                 {loading ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Executing Parallel Fan-Out (0.5s)...</span>
+                    <span>Pipeline running...</span>
                   </>
                 ) : (
                   <>
@@ -504,31 +539,31 @@ export default function App() {
             const showSpeedupBadge = speedupMultiplier > 1.05; // guard against noise on trivially fast runs
 
             return (
-            <div className="bg-slate-900/90 border border-indigo-900/40 rounded-2xl p-5 shadow-lg space-y-3">
+            <div className="bg-white border border-orange-100 rounded-2xl p-5 shadow-sm shadow-stone-200 space-y-3">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-                  <Zap className="w-3.5 h-3.5 text-amber-400" /> Concurrency Benchmark
+                <span className="text-xs font-semibold text-stone-500 uppercase tracking-wider flex items-center gap-1.5">
+                  <Zap className="w-3.5 h-3.5 text-amber-500" /> Concurrency Benchmark
                 </span>
                 {showSpeedupBadge && (
-                  <span className="text-xs font-semibold text-emerald-400 bg-emerald-950 border border-emerald-800 px-2 py-0.5 rounded-full">
+                  <span className="text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">
                     {speedupMultiplier.toFixed(1)}× Speedup
                   </span>
                 )}
               </div>
 
               <div className="grid grid-cols-2 gap-3">
-                <div className="p-3 bg-slate-950 rounded-xl border border-slate-800" title="max(worker_01, worker_03, worker_04) + worker_02 — the 4 workers' own measured times, combined the way they actually ran">
-                  <p className="text-xs text-slate-400">Parallel Fan-Out</p>
-                  <p className="text-2xl font-bold text-emerald-400 mt-0.5">
+                <div className="p-3 bg-stone-50 rounded-xl border border-stone-200" title="max(worker_01, worker_03, worker_04) + worker_02 — the 4 workers' own measured times, combined the way they actually ran">
+                  <p className="text-xs text-stone-500">Parallel Fan-Out</p>
+                  <p className="text-2xl font-bold text-amber-600 mt-0.5">
                     {actualFanOutSeconds.toFixed(2)}s
                   </p>
                 </div>
-                <div className="p-3 bg-slate-950 rounded-xl border border-slate-800" title="worker_01 + worker_02 + worker_03 + worker_04 — the same measured times, summed as if run one after another">
-                  <p className="text-xs text-slate-400">Est. Sequential</p>
-                  <p className="text-2xl font-bold text-slate-500 mt-0.5">{estimatedSequentialSeconds.toFixed(2)}s</p>
+                <div className="p-3 bg-stone-50 rounded-xl border border-stone-200" title="worker_01 + worker_02 + worker_03 + worker_04 — the same measured times, summed as if run one after another">
+                  <p className="text-xs text-stone-500">Est. Sequential</p>
+                  <p className="text-2xl font-bold text-stone-400 mt-0.5">{estimatedSequentialSeconds.toFixed(2)}s</p>
                 </div>
               </div>
-              <p className="text-[10px] text-slate-600">
+              <p className="text-[10px] text-stone-400">
                 Fan-out stage only ({pipelineData.pipeline_runtime_seconds}s total pipeline, including AI synthesis)
               </p>
             </div>
@@ -540,72 +575,92 @@ export default function App() {
         <div className="space-y-6 min-w-0">
 
           {/* Worker Status Grid */}
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
-            <div className="flex items-center gap-2 mb-4 text-white font-semibold">
-              <Layers className="w-5 h-5 text-indigo-400" />
-              <h2>Department Workers (Fan-Out Stage)</h2>
+          <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm shadow-stone-200">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2.5 text-stone-900 font-semibold">
+                <IconChip icon={<Square className="w-4 h-4" />} color="cyan" />
+                <h2>Department Workers (Fan-Out Stage)</h2>
+              </div>
+              <div className="flex items-center gap-3">
+                <span className={`text-[10px] font-semibold px-2.5 py-1 rounded-full border ${
+                  fanOutStateLabel === 'running'
+                    ? 'bg-orange-50 border-orange-200 text-orange-700'
+                    : fanOutStateLabel === 'complete'
+                    ? 'bg-amber-50 border-amber-200 text-amber-700'
+                    : 'bg-stone-100 border-stone-200 text-stone-500'
+                }`}>
+                  {totalWorkerCount} workers · {fanOutStateLabel}{fanOutStateLabel === 'running' ? ` (${runningCount})` : ''}
+                </span>
+                {pipelineElapsedMs !== null && (
+                  <span className="text-[10px] font-mono text-stone-400">{formatElapsed(pipelineElapsedMs)} elapsed</span>
+                )}
+              </div>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 2xl:grid-cols-4 gap-4">
               <WorkerCard
-                icon={<FileText className="w-4 h-4 text-indigo-400" />}
+                icon={<IconChip size="sm" color="sky" icon={<Square className="w-3.5 h-3.5" />} />}
                 title="1. Subtitles (.srt)"
                 state={workerStates.worker_01}
                 placeholder="Generating timecoded subtitle files..."
                 summarize={summarizeWorkerOne}
+                accent="sky"
               />
               <WorkerCard
-                icon={<Mic className="w-4 h-4 text-indigo-400" />}
+                icon={<IconChip size="sm" color="cyan" icon={<Square className="w-3.5 h-3.5" />} />}
                 title="2. Dubbing (Audio)"
                 state={workerStates.worker_02}
                 placeholder="Synthesizing multi-speaker audio tracks..."
                 summarize={summarizeWorkerTwo}
+                accent="cyan"
               />
               <WorkerCard
-                icon={<Crop className="w-4 h-4 text-indigo-400" />}
+                icon={<IconChip size="sm" color="violet" icon={<Square className="w-3.5 h-3.5" />} />}
                 title="3. Smart VFX (Video)"
                 state={workerStates.worker_03}
                 placeholder="Calculating 9:16 and 1:1 crop coordinates..."
                 summarize={summarizeWorkerThree}
+                accent="violet"
               />
               <WorkerCard
-                icon={<ShieldCheck className="w-4 h-4 text-indigo-400" />}
+                icon={<IconChip size="sm" color="emerald" icon={<Square className="w-3.5 h-3.5" />} />}
                 title="4. Compliance Clearance"
                 state={workerStates.worker_04}
                 placeholder="Parallel open-web clearance check..."
                 summarize={summarizeWorkerFour}
+                accent="emerald"
               />
             </div>
           </div>
 
           {/* Master Media Deliverables Center */}
           {pipelineData && (
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-6">
+            <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm shadow-stone-200 space-y-6">
 
-              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-                <div className="flex items-center gap-2 text-white font-semibold">
-                  <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+              <div className="flex items-center justify-between border-b border-stone-200 pb-3">
+                <div className="flex items-center gap-2.5 text-stone-900 font-semibold">
+                  <IconChip icon={<Square className="w-4 h-4" />} color="emerald" />
                   <h2>Master Distribution Deliverables</h2>
                 </div>
-                <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-emerald-950 text-emerald-400 border border-emerald-800">
+                <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
                   READY FOR RELEASE
                 </span>
               </div>
 
               {/* 1. Synthesized Dubbing & Dialogue Source */}
-              <div className="p-4 bg-slate-950 rounded-xl border border-slate-800 space-y-3">
+              <div className="p-4 bg-stone-50 rounded-xl border border-stone-200 space-y-3">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-300 flex items-center gap-2">
-                    <Volume2 className="w-4 h-4 text-indigo-400" /> Synthesized Dubbing & Dialogue Source
+                  <span className="text-xs font-semibold text-stone-700 flex items-center gap-2">
+                    <Volume2 className="w-4 h-4 text-orange-600" /> Synthesized Dubbing & Dialogue Source
                   </span>
-                  <span className="text-[10px] text-indigo-300 bg-indigo-950/80 px-2.5 py-0.5 rounded-full border border-indigo-800">
+                  <span className="text-[10px] text-orange-700 bg-orange-50 px-2.5 py-0.5 rounded-full border border-orange-200">
                     Source: {workerOneData?.transcription_source || "Multimodal Video Auto-Detect"}
                   </span>
                 </div>
 
-                <div className="p-2.5 bg-slate-900/60 rounded-lg border border-slate-800 text-xs">
-                  <span className="text-slate-500 font-mono text-[10px] uppercase">Processed Dialogue Baseline:</span>
-                  <p className="text-slate-300 font-mono mt-0.5 italic">
+                <div className="p-2.5 bg-white rounded-lg border border-stone-200 text-xs">
+                  <span className="text-stone-400 font-mono text-[10px] uppercase">Processed Dialogue Baseline:</span>
+                  <p className="text-stone-700 font-mono mt-0.5 italic">
                     "{workerOneData?.active_dialogue || formData.script_text}"
                   </p>
                 </div>
@@ -618,15 +673,15 @@ export default function App() {
                     : null;
 
                   return (
-                  <div key={lang} className="flex flex-col sm:flex-row items-center justify-between gap-3 p-3 bg-slate-900/90 rounded-lg border border-slate-800">
+                  <div key={lang} className="flex flex-col sm:flex-row items-center justify-between gap-3 p-3 bg-white rounded-lg border border-stone-200">
                     <div className="w-full sm:w-auto">
                       <div className="flex items-center gap-2">
-                        <span className="text-xs text-white font-semibold">{lang} Dubbed Voiceover</span>
-                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 font-mono">
+                        <span className="text-xs text-stone-900 font-semibold">{lang} Dubbed Voiceover</span>
+                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-stone-100 text-stone-500 font-mono">
                           {LANG_VOICE_CODES[lang] || 'en-US'}
                         </span>
                       </div>
-                      <p className="text-xs text-indigo-300 mt-1 font-mono italic">
+                      <p className="text-xs text-orange-700 mt-1 font-mono italic">
                         {workerOneData?.localized_dialogues?.[lang]
                           ? `"${workerOneData.localized_dialogues[lang]}"`
                           : "Awaiting Gemini localization output."}
@@ -640,8 +695,8 @@ export default function App() {
                         title={audioUrl ? "Plays the actual generated Cloud TTS audio" : "No dubbed audio generated for this language yet"}
                         className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition ${
                           playingAudio === lang
-                            ? 'bg-rose-600 text-white animate-pulse shadow-lg shadow-rose-600/30'
-                            : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/30'
+                            ? 'bg-rose-600 text-white animate-pulse shadow-md shadow-rose-600/20'
+                            : 'bg-orange-600 hover:bg-orange-700 text-white shadow-md shadow-orange-600/20'
                         } disabled:cursor-not-allowed disabled:opacity-50`}
                       >
                         {playingAudio === lang ? (
@@ -660,13 +715,13 @@ export default function App() {
                         <a
                           href={audioUrl}
                           download={downloadedFilename}
-                          className="flex items-center gap-2 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-xs font-semibold text-white transition shadow-lg shadow-emerald-600/20"
+                          className="flex items-center gap-2 px-3.5 py-2 bg-amber-600 hover:bg-amber-700 rounded-lg text-xs font-semibold text-white transition shadow-md shadow-amber-600/20"
                         >
                           <Download className="w-4 h-4" />
                           <span>Download MP3</span>
                         </a>
                       ) : (
-                        <span className="text-[10px] text-slate-500">MP3 unavailable</span>
+                        <span className="text-[10px] text-stone-400">MP3 unavailable</span>
                       )}
                     </div>
                   </div>
@@ -675,12 +730,12 @@ export default function App() {
               </div>
 
               {/* 2. Visual Social Video Crop Section */}
-              <div className="p-4 bg-slate-950 rounded-xl border border-slate-800 space-y-3">
+              <div className="p-4 bg-stone-50 rounded-xl border border-stone-200 space-y-3">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-300 flex items-center gap-2">
-                    <Smartphone className="w-4 h-4 text-indigo-400" /> Dynamic Social Video Reframing (Worker 3)
+                  <span className="text-xs font-semibold text-stone-700 flex items-center gap-2">
+                    <Smartphone className="w-4 h-4 text-orange-600" /> Dynamic Social Video Reframing (Worker 3)
                   </span>
-                  <span className="text-[10px] text-emerald-400 bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-900">
+                  <span className="text-[10px] text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">
                     FFmpeg Cropped
                   </span>
                 </div>
@@ -688,13 +743,13 @@ export default function App() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
                   {selectedPlatforms.map(platform => {
                     const style = PLATFORM_FRAME_STYLES[platform] || {
-                      label: platform, box: "w-40 h-40", border: "border-slate-600/40"
+                      label: platform, box: "w-40 h-40", border: "border-stone-300"
                     };
                     const ffmpegCommand = workerThreeData?.ffmpeg_render_pipeline?.[platform];
 
                     return (
-                      <div key={platform} className="p-3 bg-slate-900 rounded-lg border border-slate-800 flex flex-col items-center">
-                        <p className="text-xs font-semibold text-slate-300 mb-2">{style.label}</p>
+                      <div key={platform} className="p-3 bg-white rounded-lg border border-stone-200 flex flex-col items-center">
+                        <p className="text-xs font-semibold text-stone-700 mb-2">{style.label}</p>
                         <div className={`${style.box} bg-black rounded-lg overflow-hidden border ${style.border} relative shadow-inner`}>
                           <video
                             src={formData.video_url}
@@ -713,7 +768,7 @@ export default function App() {
                             `${formData.title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${platform.replace(/[^a-z0-9]/gi, '_')}_crop.sh`,
                             ffmpegCommand || ""
                           )}
-                          className="mt-2 w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 bg-slate-950 hover:bg-slate-800 border border-slate-800 rounded-lg text-[10px] font-mono text-slate-400 disabled:cursor-not-allowed disabled:opacity-50 transition"
+                          className="mt-2 w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 bg-stone-50 hover:bg-stone-100 border border-stone-200 rounded-lg text-[10px] font-mono text-stone-500 disabled:cursor-not-allowed disabled:opacity-50 transition"
                           title={ffmpegCommand}
                         >
                           <Download className="w-3 h-3" />
@@ -725,8 +780,8 @@ export default function App() {
                 </div>
 
                 {/* Final Assembly (Google Cloud Transcoder) — additive stage */}
-                <div className="pt-3 mt-1 border-t border-slate-800 space-y-3">
-                  <p className="text-[11px] text-slate-500">
+                <div className="pt-3 mt-1 border-t border-stone-200 space-y-3">
+                  <p className="text-[11px] text-stone-500">
                     Render broadcast-ready .mp4s combining the crop, dub audio, and subtitles above via Google Cloud Transcoder.
                     Choose which language to use for each platform (from what you selected above):
                   </p>
@@ -735,12 +790,12 @@ export default function App() {
                     {selectedPlatforms.map(platform => {
                       const rendition = getPlatformRendition(platform);
                       return (
-                        <div key={platform} className="flex flex-col sm:flex-row sm:items-center gap-2 p-2.5 bg-slate-900/60 rounded-lg border border-slate-800">
-                          <span className="text-xs font-semibold text-slate-300 sm:w-36 shrink-0">{platform}</span>
+                        <div key={platform} className="flex flex-col sm:flex-row sm:items-center gap-2 p-2.5 bg-white rounded-lg border border-stone-200">
+                          <span className="text-xs font-semibold text-stone-700 sm:w-36 shrink-0">{platform}</span>
                           <select
                             value={rendition.dubLanguage}
                             onChange={(e) => setPlatformRenditions(prev => ({ ...prev, [platform]: { ...prev[platform], dubLanguage: e.target.value } }))}
-                            className="flex-1 px-2 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-slate-200"
+                            className="flex-1 px-2 py-1.5 bg-white border border-stone-300 rounded-lg text-xs text-stone-700"
                           >
                             <option value="">No dub audio</option>
                             {selectedDubLanguages.map(lang => <option key={lang} value={lang}>{lang} dub</option>)}
@@ -748,7 +803,7 @@ export default function App() {
                           <select
                             value={rendition.subtitleLanguage}
                             onChange={(e) => setPlatformRenditions(prev => ({ ...prev, [platform]: { ...prev[platform], subtitleLanguage: e.target.value } }))}
-                            className="flex-1 px-2 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-slate-200"
+                            className="flex-1 px-2 py-1.5 bg-white border border-stone-300 rounded-lg text-xs text-stone-700"
                           >
                             <option value="">No subtitles</option>
                             {selectedSubtitleLanguages.map(lang => <option key={lang} value={lang}>{lang} subs</option>)}
@@ -761,7 +816,7 @@ export default function App() {
                   <button
                     onClick={handleAssembleFinal}
                     disabled={renderSubmitting || !workerTwoData}
-                    className="w-full flex items-center justify-center gap-2 px-3.5 py-2 bg-violet-600 hover:bg-violet-500 rounded-lg text-xs font-semibold text-white shadow-lg shadow-violet-600/20 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="w-full flex items-center justify-center gap-2 px-3.5 py-2 bg-orange-600 hover:bg-orange-700 rounded-lg text-xs font-semibold text-white shadow-md shadow-orange-600/20 transition disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {renderSubmitting ? (
                       <Loader2 className="w-4 h-4 animate-spin" />
@@ -780,23 +835,23 @@ export default function App() {
 
                     return (
                     <div className="space-y-2">
-                      <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-slate-500">
+                      <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-stone-400">
                         <span>Render Job {renderJob.render_job_id.slice(0, 8)} — {renderJob.overall_status}</span>
-                        <span className="font-mono normal-case text-slate-400">
+                        <span className="font-mono normal-case text-stone-500">
                           {isActive ? `⏱ ${formatElapsed(elapsedMs)} elapsed` : `Done in ${formatElapsed(elapsedMs)}`}
                         </span>
                       </div>
 
                       <div className="space-y-1">
-                        <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                        <div className="w-full h-1.5 bg-stone-200 rounded-full overflow-hidden">
                           <div
                             className={`h-full rounded-full transition-all duration-500 ${
-                              renderJob.overall_status === 'FAILED' ? 'bg-rose-500' : 'bg-violet-500'
+                              renderJob.overall_status === 'FAILED' ? 'bg-rose-500' : 'bg-orange-500'
                             }`}
                             style={{ width: `${progressPercent}%` }}
                           />
                         </div>
-                        <p className="text-[10px] text-slate-500">
+                        <p className="text-[10px] text-stone-400">
                           {completedCount} of {totalCount} render{totalCount !== 1 ? 's' : ''} complete
                         </p>
                       </div>
@@ -804,14 +859,14 @@ export default function App() {
                       {renderJob.outputs.map((output) => (
                         <div
                           key={`${output.platform}-${output.dub_language}-${output.subtitle_language}`}
-                          className="flex items-center justify-between gap-3 p-2.5 bg-slate-900/90 rounded-lg border border-slate-800"
+                          className="flex items-center justify-between gap-3 p-2.5 bg-white rounded-lg border border-stone-200"
                         >
-                          <div className="text-xs text-slate-300">
-                            <span className="font-semibold text-white">{output.platform}</span>
+                          <div className="text-xs text-stone-700">
+                            <span className="font-semibold text-stone-900">{output.platform}</span>
                             {" · "}{output.dub_language ? `${output.dub_language} dub` : "no dub"}
                             {" + "}{output.subtitle_language ? `${output.subtitle_language} subs` : "no subs"}
                             {output.error && (
-                              <p className="text-[10px] text-rose-400 mt-0.5 max-w-xs truncate" title={output.error}>
+                              <p className="text-[10px] text-rose-600 mt-0.5 max-w-xs truncate" title={output.error}>
                                 {output.error}
                               </p>
                             )}
@@ -819,7 +874,7 @@ export default function App() {
                           {output.status === "SUCCEEDED" && output.download_url ? (
                             <a
                               href={output.download_url}
-                              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-[11px] font-semibold text-white transition"
+                              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-amber-600 hover:bg-amber-700 rounded-lg text-[11px] font-semibold text-white transition"
                             >
                               <Download className="w-3.5 h-3.5" />
                               <span>Download</span>
@@ -827,8 +882,8 @@ export default function App() {
                           ) : (
                             <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
                               output.status === "FAILED" || output.status === "NOT_CONFIGURED"
-                                ? 'bg-rose-950 text-rose-400 border-rose-800'
-                                : 'bg-indigo-950 text-indigo-400 border-indigo-800 animate-pulse'
+                                ? 'bg-rose-50 text-rose-700 border-rose-200'
+                                : 'bg-orange-50 text-orange-700 border-orange-200 animate-pulse'
                             }`}>
                               {output.status}
                             </span>
@@ -853,18 +908,18 @@ export default function App() {
                     href={subtitleFilename ? `${API_BASE_URL}/api/v1/downloads/subtitle/${encodeURIComponent(subtitleFilename)}` : undefined}
                     download={subtitleFilename}
                     aria-disabled={!subtitleFilename}
-                    className={`p-3 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between transition text-left ${
-                      subtitleFilename ? 'hover:bg-slate-900 hover:border-indigo-500/60' : 'cursor-not-allowed opacity-50 pointer-events-none'
+                    className={`p-3 bg-white border border-stone-200 rounded-xl flex items-center justify-between transition text-left ${
+                      subtitleFilename ? 'hover:bg-stone-50 hover:border-orange-300' : 'cursor-not-allowed opacity-50 pointer-events-none'
                     }`}
                   >
                     <div className="flex items-center gap-2.5">
-                      <FileText className="w-4 h-4 text-indigo-400" />
+                      <FileText className="w-4 h-4 text-orange-600" />
                       <div>
-                        <p className="text-xs font-semibold text-slate-200">{lang} Subtitle File</p>
-                        <p className="text-[10px] text-slate-500">.srt format</p>
+                        <p className="text-xs font-semibold text-stone-800">{lang} Subtitle File</p>
+                        <p className="text-[10px] text-stone-400">.srt format</p>
                       </div>
                     </div>
-                    <Download className="w-4 h-4 text-slate-400" />
+                    <Download className="w-4 h-4 text-stone-400" />
                   </a>
                   );
                 })}
@@ -889,21 +944,21 @@ export default function App() {
                         `Compliance Checks:\n${(workerFourData?.compliance_checks || []).map(c => ` - ${c}`).join("\n")}\n` +
                         `========================================`
                       )}
-                      className="p-3 bg-slate-950 hover:bg-slate-900 border border-slate-800 hover:border-emerald-500/60 rounded-xl flex items-center justify-between transition text-left disabled:cursor-not-allowed disabled:opacity-50"
+                      className="p-3 bg-white hover:bg-stone-50 border border-stone-200 hover:border-amber-300 rounded-xl flex items-center justify-between transition text-left disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       <div className="flex items-center gap-2.5 min-w-0">
-                        <FileCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <FileCheck className="w-4 h-4 text-amber-600 shrink-0" />
                         <div className="min-w-0">
-                          <p className="text-xs font-semibold text-slate-200">Compliance Certificate</p>
+                          <p className="text-xs font-semibold text-stone-800">Compliance Certificate</p>
                           <p
-                            className={`text-[10px] font-mono truncate ${isLiveVerified ? 'text-emerald-400' : 'text-slate-500'}`}
+                            className={`text-[10px] font-mono truncate ${isLiveVerified ? 'text-amber-600' : 'text-stone-400'}`}
                             title={isLiveVerified ? `Full Parallel Task Run ID: ${runId}` : 'No live API key supplied; using local compliance cache'}
                           >
                             {isLiveVerified ? `✓ Verified via Parallel Task ${shortRunId}` : 'Local mock mode — not live-verified'}
                           </p>
                         </div>
                       </div>
-                      <Download className="w-4 h-4 text-slate-400 shrink-0" />
+                      <Download className="w-4 h-4 text-stone-400 shrink-0" />
                     </button>
                   );
                 })()}
@@ -961,43 +1016,91 @@ function summarizeWorkerFour(data) {
   };
 }
 
-function WorkerCard({ icon, title, state, placeholder, summarize }) {
+const ICON_CHIP_COLORS = {
+  cyan: 'bg-orange-50 text-orange-600',
+  sky: 'bg-amber-50 text-amber-600',
+  violet: 'bg-orange-50 text-orange-600',
+  emerald: 'bg-amber-50 text-amber-600',
+};
+
+// A colored icon "chip" instead of a bare glyph — gives section/card icons
+// visual weight. Every category now renders as a shade of orange (orange
+// or amber) instead of a distinct hue per domain.
+function IconChip({ icon, color = 'cyan', size = 'md' }) {
+  const sizeClasses = size === 'sm' ? 'w-7 h-7' : 'w-9 h-9';
+  return (
+    <div className={`${sizeClasses} rounded-lg flex items-center justify-center shrink-0 ${ICON_CHIP_COLORS[color]}`}>
+      {icon}
+    </div>
+  );
+}
+
+// Dot-indicator status pill — mirrors the accent color of the worker it
+// belongs to instead of a single generic "running" color, so the badge and
+// the card's icon chip read as one unit.
+const STATUS_BADGE_COLORS = {
+  RUNNING: {
+    cyan: 'bg-orange-50 border-orange-200 text-orange-700',
+    sky: 'bg-amber-50 border-amber-200 text-amber-700',
+    violet: 'bg-orange-50 border-orange-200 text-orange-700',
+    emerald: 'bg-amber-50 border-amber-200 text-amber-700',
+  },
+  SUCCESS: 'bg-amber-50 border-amber-200 text-amber-700',
+  IDLE: 'bg-stone-100 border-stone-200 text-stone-500',
+};
+const DOT_COLORS = {
+  cyan: 'bg-orange-500', sky: 'bg-amber-500', violet: 'bg-orange-500', emerald: 'bg-amber-500',
+};
+
+function WorkerCard({ icon, title, state, placeholder, summarize, accent = 'cyan' }) {
   const isRunning = state.status === 'RUNNING';
   const isSuccess = state.status === 'SUCCESS';
   const summary = isSuccess && summarize ? summarize(state.data) : null;
 
+  const badgeClasses = isRunning
+    ? STATUS_BADGE_COLORS.RUNNING[accent]
+    : isSuccess
+    ? STATUS_BADGE_COLORS.SUCCESS
+    : STATUS_BADGE_COLORS.IDLE;
+  const dotClasses = isRunning ? DOT_COLORS[accent] : isSuccess ? 'bg-amber-500' : 'bg-stone-400';
+
   return (
-    <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 transition flex flex-col justify-between min-h-32">
+    <div className="p-4 rounded-xl bg-stone-50 border border-stone-200 transition flex flex-col justify-between min-h-32">
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2 text-xs font-semibold text-slate-200">
+        <div className="flex items-center gap-2 text-xs font-semibold text-stone-800">
           {icon}
           <span>{title}</span>
         </div>
-        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border shrink-0 ${
-          isRunning
-            ? 'bg-indigo-950 text-indigo-400 border-indigo-800 animate-pulse'
-            : isSuccess
-            ? 'bg-emerald-950 text-emerald-400 border-emerald-800'
-            : 'bg-slate-800/60 text-slate-400 border-slate-700'
-        }`}>
-          {isRunning ? 'RUNNING' : isSuccess ? `SUCCESS (${state.time}s)` : 'IDLE'}
+        <span className={`flex items-center gap-1.5 text-[10px] font-bold px-2 py-0.5 rounded-full border shrink-0 ${badgeClasses}`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${dotClasses} ${isRunning ? 'animate-pulse' : ''}`} />
+          {isRunning ? 'Running' : isSuccess ? `${state.time}s` : 'Idle'}
         </span>
       </div>
 
       <div className="mt-2">
-        <p className="text-xs text-slate-400 line-clamp-2">
+        <p className="text-xs text-stone-500 line-clamp-2">
           {isSuccess ? (summary?.text || placeholder) : placeholder}
         </p>
         {summary?.warning && (
-          <p className="text-[10px] text-amber-400 mt-1 line-clamp-1" title={summary.warning}>
+          <p className="text-[10px] text-amber-600 mt-1 line-clamp-1" title={summary.warning}>
             ⚠ {summary.warning}
           </p>
         )}
         {summary?.verified && (
-          <p className="text-[10px] text-emerald-400 font-mono mt-1 line-clamp-1" title={summary.verified}>
+          <p className="text-[10px] text-amber-600 font-mono mt-1 line-clamp-1" title={summary.verified}>
             ✓ {summary.verified}
           </p>
         )}
+      </div>
+
+      {/* Activity track — an indeterminate pulse while running and a solid
+          fill on success communicate state honestly; there is no per-worker
+          progress percentage from the backend to show here, so this never
+          fabricates one (RUNNING/SUCCESS/IDLE is all the API reports). */}
+      <div className="mt-3 w-full h-1 bg-stone-200 rounded-full overflow-hidden">
+        <div className={`h-full rounded-full transition-all duration-500 ${
+          isRunning ? `w-full ${dotClasses} opacity-50 animate-pulse` : isSuccess ? `w-full ${dotClasses}` : 'w-0'
+        }`} />
       </div>
     </div>
   );
