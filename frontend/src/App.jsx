@@ -35,6 +35,15 @@ const LANG_VOICE_CODES = {
   German: 'de-DE'
 };
 
+// A raw YouTube page URL isn't a playable video file — the backend resolves
+// it server-side via yt-dlp, but a plain <video src> tag in the browser
+// can't play it directly, so the crop preview needs YouTube's embed player
+// instead whenever the source looks like a YouTube link.
+function getYouTubeEmbedUrl(url) {
+  const match = url.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([a-zA-Z0-9_-]{6,})/);
+  return match ? `https://www.youtube.com/embed/${match[1]}` : null;
+}
+
 // Selectable-pill color tokens per category — unselected pills share one
 // muted look; selected pills pick up an orange-family accent (all shades of
 // orange/amber, per category) so the same color language used on the
@@ -409,6 +418,9 @@ export default function App() {
                     placeholder="e.g. We have to venture into the subconscious mind before the collapse begins."
                     className="w-full px-3.5 py-2.5 bg-white border border-stone-300 rounded-xl text-sm focus:border-orange-500 focus:ring-2 focus:ring-orange-100 outline-none text-stone-900 placeholder:text-stone-400 resize-none transition"
                   />
+                  <p className="text-[10px] text-stone-400 mt-1">
+                    Optional — leave blank to auto-transcribe the video instead. Whatever text ends up here becomes the dubbed audio and subtitles.
+                  </p>
                 </div>
 
                 <div>
@@ -417,10 +429,13 @@ export default function App() {
                     type="url"
                     value={formData.video_url}
                     onChange={(e) => setFormData({ ...formData, video_url: e.target.value })}
-                    placeholder="e.g. https://vjs.zencdn.net/v/oceans.mp4"
+                    placeholder="e.g. https://vjs.zencdn.net/v/oceans.mp4 or a YouTube link"
                     required
                     className="w-full px-3.5 py-2.5 bg-white border border-stone-300 rounded-xl text-sm focus:border-orange-500 focus:ring-2 focus:ring-orange-100 outline-none text-stone-900 placeholder:text-stone-400 transition"
                   />
+                  <p className="text-[10px] text-stone-400 mt-1">
+                    Supports direct video file links (.mp4, etc.), gs:// Cloud Storage paths, and YouTube URLs (watch/shorts links).
+                  </p>
                 </div>
               </div>
 
@@ -739,7 +754,7 @@ export default function App() {
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
-                  {selectedPlatforms.map(platform => {
+                  {(() => { const youtubeEmbedUrl = getYouTubeEmbedUrl(formData.video_url); return selectedPlatforms.map(platform => {
                     const style = PLATFORM_FRAME_STYLES[platform] || {
                       label: platform, box: "w-40 h-40", border: "border-stone-300"
                     };
@@ -749,16 +764,26 @@ export default function App() {
                       <div key={platform} className="p-3 bg-white rounded-lg border border-stone-200 flex flex-col items-center">
                         <p className="text-xs font-semibold text-stone-700 mb-2">{style.label}</p>
                         <div className={`${style.box} bg-black rounded-lg overflow-hidden border ${style.border} relative shadow-inner`}>
-                          <video
-                            src={formData.video_url}
-                            controls
-                            autoPlay
-                            muted
-                            loop
-                            playsInline
-                            crossOrigin="anonymous"
-                            className="object-cover w-full h-full"
-                          />
+                          {youtubeEmbedUrl ? (
+                            <iframe
+                              src={youtubeEmbedUrl}
+                              title={`${platform} preview`}
+                              allow="autoplay; encrypted-media"
+                              className="w-full h-full"
+                              frameBorder="0"
+                            />
+                          ) : (
+                            <video
+                              src={formData.video_url}
+                              controls
+                              autoPlay
+                              muted
+                              loop
+                              playsInline
+                              crossOrigin="anonymous"
+                              className="object-cover w-full h-full"
+                            />
+                          )}
                         </div>
                         <button
                           disabled={!ffmpegCommand}
@@ -774,7 +799,7 @@ export default function App() {
                         </button>
                       </div>
                     );
-                  })}
+                  }); })()}
                 </div>
 
                 {/* Final Assembly (Google Cloud Transcoder) — additive stage */}

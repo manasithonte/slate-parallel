@@ -2,12 +2,71 @@
 import os
 import re
 import subprocess
+import tempfile
 from typing import Optional
 
 try:
     from google.cloud import texttospeech
 except ImportError:
     texttospeech = None
+
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
+YOUTUBE_URL_PATTERN = re.compile(
+    r"(?:youtube(?:-nocookie)?\.com/(?:watch|shorts/|embed/)|youtu\.be/)", re.IGNORECASE
+)
+
+
+def is_youtube_url(url: str) -> bool:
+    """True if url points at a YouTube watch/shorts/embed page rather than a direct video file."""
+    return bool(YOUTUBE_URL_PATTERN.search(url))
+
+
+def download_youtube_video(url: str) -> str:
+    """Download a YouTube video to a local temp .mp4 via yt-dlp.
+
+    Plain urllib GETs (used elsewhere for direct video-file URLs) can't fetch
+    YouTube — the watch/shorts page is HTML, not a video stream, and YouTube's
+    actual media is served as time-limited, IP-locked CDN URLs. yt-dlp handles
+    that resolution and, when the source is split into separate video/audio
+    streams, uses the ffmpeg already in this image to mux them into one mp4.
+    Caller owns the returned path and must delete it when done.
+    """
+    if not yt_dlp:
+        raise RuntimeError("yt-dlp is not installed")
+
+    fd, temp_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    os.remove(temp_path)  # yt-dlp writes to this exact path itself
+
+    ydl_opts = {
+        # H.264 (avc1) explicitly preferred: Google Cloud Transcoder's input
+        # decoder rejects AV1 (confirmed live — "MalformattedInput" on a
+        # video whose only available stream was AV1), which yt-dlp's default
+        # "best" selector happily picks for higher-resolution uploads. Only
+        # falls through to whatever's available if no H.264 stream exists.
+        "format": (
+            "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]"
+            "/best[vcodec^=avc1][ext=mp4]"
+            "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+            "/best[ext=mp4]/best"
+        ),
+        "outtmpl": temp_path,
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "noprogress": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    if not os.path.exists(temp_path):
+        raise RuntimeError("yt-dlp did not produce an output file")
+    return temp_path
 
 OUTPUT_DIR = "outputs"
 os.makedirs(os.path.join(OUTPUT_DIR, "subtitles"), exist_ok=True)

@@ -8,9 +8,11 @@ from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from src.schemas import DepartmentOutput
 from src.media_engine import (
+    download_youtube_video,
     generate_crop_ffmpeg_command,
     generate_dubbed_audio_file,
     generate_srt_file,
+    is_youtube_url,
 )
 
 load_dotenv()
@@ -48,21 +50,29 @@ def _transcribe_video_sync(client, video_url: str) -> str:
     try:
         if video_url.startswith("gs://"):
             video_part = types.Part.from_uri(file_uri=video_url, mime_type="video/mp4")
-        elif video_url.startswith(("http://", "https://")):
-            request = urllib.request.Request(video_url, headers={"User-Agent": "SlateParallel/1.0"})
-            with urllib.request.urlopen(request, timeout=60) as response:
-                content_length = int(response.headers.get("Content-Length", "0"))
-                max_bytes = 100 * 1024 * 1024
-                if content_length > max_bytes:
-                    raise ValueError("Video exceeds the 100 MB upload limit")
-                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temporary_file:
-                    temporary_path = temporary_file.name
-                    total_bytes = 0
-                    while chunk := response.read(1024 * 1024):
-                        total_bytes += len(chunk)
-                        if total_bytes > max_bytes:
-                            raise ValueError("Video exceeds the 100 MB upload limit")
-                        temporary_file.write(chunk)
+        else:
+            if is_youtube_url(video_url):
+                # YouTube pages aren't a fetchable video stream — yt-dlp
+                # resolves the actual (time-limited, IP-locked) media and
+                # downloads it, muxing separate video/audio tracks if needed.
+                temporary_path = download_youtube_video(video_url)
+            elif video_url.startswith(("http://", "https://")):
+                request = urllib.request.Request(video_url, headers={"User-Agent": "SlateParallel/1.0"})
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    content_length = int(response.headers.get("Content-Length", "0"))
+                    max_bytes = 100 * 1024 * 1024
+                    if content_length > max_bytes:
+                        raise ValueError("Video exceeds the 100 MB upload limit")
+                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temporary_file:
+                        temporary_path = temporary_file.name
+                        total_bytes = 0
+                        while chunk := response.read(1024 * 1024):
+                            total_bytes += len(chunk)
+                            if total_bytes > max_bytes:
+                                raise ValueError("Video exceeds the 100 MB upload limit")
+                            temporary_file.write(chunk)
+            else:
+                raise ValueError("Video URL must use https://, http://, or gs://")
 
             uploaded_file = client.files.upload(file=temporary_path)
             deadline = time.monotonic() + 120
@@ -73,8 +83,6 @@ def _transcribe_video_sync(client, video_url: str) -> str:
                 time.sleep(2)
                 uploaded_file = client.files.get(name=uploaded_file.name)
             video_part = uploaded_file
-        else:
-            raise ValueError("Video URL must use https://, http://, or gs://")
 
         response = client.models.generate_content(
             model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),

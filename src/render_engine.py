@@ -27,7 +27,7 @@ from typing import Dict, Optional, Tuple
 from dotenv import load_dotenv
 
 from src import gcs_engine
-from src.media_engine import crop_and_burn_subtitles, get_crop_parameters
+from src.media_engine import crop_and_burn_subtitles, download_youtube_video, get_crop_parameters, is_youtube_url
 from src.schemas import RenderJob, RenderJobRequest, RenderJobStatus, RenderOutput
 
 try:
@@ -110,6 +110,9 @@ def _download_source_to_local(video_url: str) -> str:
     platform — Transcoder can't read local paths, and this must happen
     before the per-platform upload. Caller is responsible for deleting the
     result."""
+    if is_youtube_url(video_url):
+        return download_youtube_video(video_url)
+
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
         local_path = temp_file.name
 

@@ -17,6 +17,8 @@ try:
 except ImportError:
     storage = None
 
+from src.media_engine import download_youtube_video, is_youtube_url
+
 load_dotenv()
 
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "")
@@ -47,9 +49,19 @@ def upload_to_gcs(local_path: str, dest_blob_name: str) -> str:
 
 
 def upload_source_video(video_url_or_path: str, render_job_id: str) -> str:
-    """Stage the source video in GCS, handling gs://, local path, and http(s) inputs."""
+    """Stage the source video in GCS, handling gs://, local path, YouTube, and http(s) inputs."""
     if video_url_or_path.startswith("gs://"):
         return video_url_or_path
+
+    if is_youtube_url(video_url_or_path):
+        temporary_path = download_youtube_video(video_url_or_path)
+        try:
+            return upload_to_gcs(
+                temporary_path, f"renders/{render_job_id}/source.mp4"
+            )
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
 
     if video_url_or_path.startswith(("http://", "https://")):
         request = urllib.request.Request(
