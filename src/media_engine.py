@@ -60,6 +60,12 @@ def download_youtube_video(url: str) -> str:
         "no_warnings": True,
         "noplaylist": True,
         "noprogress": True,
+        # YouTube's bot-detection ("Sign in to confirm you're not a bot")
+        # targets the web client's request pattern and is much more
+        # aggressive from cloud/datacenter IPs (Cloud Run, etc.) than
+        # residential ones. The Android client hits a different, unauthenticated
+        # API surface that isn't subject to the same check.
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
