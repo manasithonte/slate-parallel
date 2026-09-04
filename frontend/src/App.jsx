@@ -429,12 +429,12 @@ export default function App() {
                     type="url"
                     value={formData.video_url}
                     onChange={(e) => setFormData({ ...formData, video_url: e.target.value })}
-                    placeholder="e.g. https://vjs.zencdn.net/v/oceans.mp4 or a YouTube link"
+                    placeholder="e.g. https://vjs.zencdn.net/v/oceans.mp4"
                     required
                     className="w-full px-3.5 py-2.5 bg-white border border-stone-300 rounded-xl text-sm focus:border-orange-500 focus:ring-2 focus:ring-orange-100 outline-none text-stone-900 placeholder:text-stone-400 transition"
                   />
                   <p className="text-[10px] text-stone-400 mt-1">
-                    Supports direct video file links (.mp4, etc.), gs:// Cloud Storage paths, and YouTube URLs (watch/shorts links).
+                    Supports direct video file links (.mp4, etc.) and gs:// Cloud Storage paths. YouTube links are not supported — YouTube blocks automated downloads from cloud servers.
                   </p>
                 </div>
               </div>
