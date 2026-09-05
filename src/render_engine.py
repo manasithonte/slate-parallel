@@ -107,9 +107,17 @@ async def get_render_job(render_job_id: str) -> Optional[RenderJob]:
     client = _get_firestore_client()
     if not client:
         return None
-    doc = await asyncio.to_thread(
-        lambda: client.collection(RENDER_JOBS_COLLECTION).document(render_job_id).get()
-    )
+    try:
+        doc = await asyncio.to_thread(
+            lambda: client.collection(RENDER_JOBS_COLLECTION).document(render_job_id).get()
+        )
+    except Exception as exc:
+        # Same best-effort spirit as _persist's write side — Firestore being
+        # unreachable/misconfigured should surface as "job not found" (a
+        # normal 404 the frontend already handles), not a 500 that crashes
+        # the whole status-poll endpoint.
+        print(f"[Render Job Persistence] Failed to read {render_job_id}: {exc}")
+        return None
     if doc.exists:
         return RenderJob(**doc.to_dict())
     return None
