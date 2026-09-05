@@ -452,7 +452,7 @@ export default function App() {
                     className="w-full px-3.5 py-2.5 bg-white border border-stone-300 rounded-xl text-sm focus:border-orange-500 focus:ring-2 focus:ring-orange-100 outline-none text-stone-900 placeholder:text-stone-400 resize-none transition"
                   />
                   <p className="text-[10px] text-stone-400 mt-1">
-                    Optional — leave blank to auto-transcribe the video instead. Whatever text ends up here becomes the dubbed audio and subtitles. Prefix a line with a timestamp (e.g. "[00:05] Line one") to control exactly when each line starts — otherwise every line is treated as one untimed block.
+                    Optional: leave blank to auto-transcribe the video instead. Whatever text ends up here becomes the dubbed audio and subtitles. Prefix a line with a timestamp (e.g. "[00:05] Line one") to control exactly when each line starts; otherwise every line is treated as one untimed block.
                   </p>
                 </div>
 
@@ -499,7 +499,7 @@ export default function App() {
                     <p className="text-[10px] text-rose-600 mt-1">Upload failed: {uploadState.error}</p>
                   )}
                   <p className="text-[10px] text-stone-400 mt-1">
-                    Paste a direct video file link (.mp4, etc.) or a gs:// Cloud Storage path, or upload a file directly. YouTube links are not supported — YouTube blocks automated downloads from cloud servers.
+                    Paste a direct video file link (.mp4, etc.) or a gs:// Cloud Storage path, or upload a file directly. YouTube links are not supported, YouTube blocks automated downloads from cloud servers.
                   </p>
                 </div>
               </div>
