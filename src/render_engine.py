@@ -27,7 +27,7 @@ from typing import Dict, Optional, Tuple
 from dotenv import load_dotenv
 
 from src import gcs_engine
-from src.media_engine import crop_and_burn_subtitles, download_youtube_video, get_crop_parameters, is_youtube_url
+from src.media_engine import crop_and_burn_subtitles, download_youtube_video, get_crop_parameters, is_youtube_url, pad_audio_to_duration
 from src.schemas import RenderJob, RenderJobRequest, RenderJobStatus, RenderOutput
 
 try:
@@ -431,7 +431,20 @@ async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
             dub_audio_uris[dub_language] = None
             dub_audio_durations[dub_language] = None
             return
-        dub_audio_durations[dub_language] = await asyncio.to_thread(_probe_audio_duration, audio_path)
+        audio_duration = await asyncio.to_thread(_probe_audio_duration, audio_path)
+        if audio_duration < video_duration:
+            # A dub track shorter than the source video used to force the
+            # EditAtom below to trim to the shorter of the two — cutting the
+            # video itself short to match. Padding the audio with trailing
+            # silence up to the video's own length means the atom can always
+            # be trimmed to the full video length instead (see _build_job).
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as padded_file:
+                padded_path = padded_file.name
+            rendered_local_paths.append(padded_path)
+            await asyncio.to_thread(pad_audio_to_duration, audio_path, video_duration, padded_path)
+            audio_path = padded_path
+            audio_duration = video_duration
+        dub_audio_durations[dub_language] = audio_duration
         dub_audio_uris[dub_language] = await asyncio.to_thread(
             gcs_engine.upload_to_gcs, audio_path,
             f"renders/{render_job_id}/audio_{dub_language.lower()}.mp3"

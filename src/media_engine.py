@@ -89,22 +89,78 @@ LANGUAGE_CODES = {
 }
 
 
-def generate_dubbed_audio_file(title: str, language: str, text: str) -> str:
-    """Synthesize a localized MP3 with Google Cloud Text-to-Speech."""
+# Master-script convention for hand-specifying line timing: "[MM:SS] text",
+# one per line. A script with no lines matching this pattern is treated as
+# a single untimed block starting at 0s (same shape either way — a list of
+# {"start": seconds, "text": ...} segments — so downstream code never needs
+# to know which case produced it).
+SCRIPT_TIMESTAMP_PATTERN = re.compile(r'^\[(\d{1,3}):(\d{2})\]\s*(.+)$')
+
+
+def parse_script_segments(script_text: str) -> list:
+    """Parse a master script into timed segments.
+
+    Recognizes "[MM:SS] line text" per line; a script with no such markers
+    becomes one segment starting at 0s so the rest of the pipeline (SRT
+    generation, dub-audio placement) can treat every source of dialogue —
+    master script, hand-timed or not, or auto-transcription — identically.
+    Every segment carries a "gender" field for TTS voice selection; a script
+    has no audio to infer it from, so it's always "neutral" here (auto-
+    transcription is the only source that can detect this, from the video's
+    actual audio).
+    """
+    segments = []
+    for line in script_text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = SCRIPT_TIMESTAMP_PATTERN.match(line)
+        if match:
+            minutes, seconds, text = match.groups()
+            start = int(minutes) * 60 + int(seconds)
+            if text.strip():
+                segments.append({"start": float(start), "text": text.strip(), "gender": "neutral"})
+    if segments:
+        segments.sort(key=lambda s: s["start"])
+        return segments
+    stripped = script_text.strip()
+    return [{"start": 0.0, "text": stripped, "gender": "neutral"}] if stripped else []
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    """Seconds -> SRT's "HH:MM:SS,mmm" timestamp format."""
+    seconds = max(0.0, seconds)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int(round((seconds - int(seconds)) * 1000))
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _tts_gender(gender: str):
+    if gender == "male":
+        return texttospeech.SsmlVoiceGender.MALE
+    if gender == "female":
+        return texttospeech.SsmlVoiceGender.FEMALE
+    return texttospeech.SsmlVoiceGender.NEUTRAL
+
+
+def _synthesize_speech(text: str, language: str, gender: str = "neutral") -> bytes:
+    """Raw Cloud TTS call for one line of text. Shared by every segment in
+    assemble_dubbed_track — kept separate so each segment can be synthesized
+    (and later time-placed) independently instead of as one fused block.
+    `gender` ("male"/"female"/"neutral", from Gemini's speaker-gender
+    detection on auto-transcribed video) picks an actual matching voice —
+    Cloud TTS maps ssml_gender to a distinct voice per language, not just a
+    pitch tweak on one fixed voice."""
     if not texttospeech:
         raise RuntimeError("Google Cloud Text-to-Speech SDK is not installed")
-    if not text.strip():
-        raise ValueError("Cannot synthesize an empty dubbed-audio track")
-
-    safe_title = re.sub(r"[^a-zA-Z0-9_]", "_", title.lower())
-    filename = f"{safe_title}_{language.lower()}_dub.mp3"
-    filepath = os.path.join(OUTPUT_DIR, "audio", filename)
     client = texttospeech.TextToSpeechClient()
     response = client.synthesize_speech(
         input=texttospeech.SynthesisInput(text=text),
         voice=texttospeech.VoiceSelectionParams(
             language_code=LANGUAGE_CODES.get(language, "en-US"),
-            ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL,
+            ssml_gender=_tts_gender(gender),
         ),
         audio_config=texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.MP3,
@@ -112,26 +168,115 @@ def generate_dubbed_audio_file(title: str, language: str, text: str) -> str:
             pitch=-0.95,
         ),
     )
-    with open(filepath, "wb") as audio_file:
-        audio_file.write(response.audio_content)
-    return filepath
+    return response.audio_content
 
-def generate_srt_file(title: str, language: str, text: str) -> str:
-    """Writes a standardized .srt subtitle track file."""
+
+def assemble_dubbed_track(title: str, language: str, segments: list) -> str:
+    """Synthesize each dialogue segment and place it at its own timestamp in
+    one composite MP3, instead of fusing all dialogue into a single clip
+    starting at 0s — the latter is exactly why dubbed audio used to drift out
+    of sync with the video the longer a clip ran.
+    """
+    if not texttospeech:
+        raise RuntimeError("Google Cloud Text-to-Speech SDK is not installed")
+    if not segments:
+        raise ValueError("Cannot synthesize a dubbed-audio track with no dialogue segments")
+
+    safe_title = re.sub(r"[^a-zA-Z0-9_]", "_", title.lower())
+    filename = f"{safe_title}_{language.lower()}_dub.mp3"
+    filepath = os.path.join(OUTPUT_DIR, "audio", filename)
+
+    clip_paths = []
+    try:
+        for segment in segments:
+            audio_bytes = _synthesize_speech(segment["text"], language, segment.get("gender", "neutral"))
+            fd, clip_path = tempfile.mkstemp(suffix=".mp3")
+            with os.fdopen(fd, "wb") as clip_file:
+                clip_file.write(audio_bytes)
+            clip_paths.append(clip_path)
+
+        if len(segments) == 1 and segments[0]["start"] <= 0.01:
+            # Common case (no script timestamps / single-block dialogue) —
+            # nothing to place, the one clip already belongs at the start.
+            os.replace(clip_paths[0], filepath)
+            clip_paths = []
+            return filepath
+
+        # Delay each clip to its own start time, then mix them onto one
+        # track. amix's default per-input volume drop (1/N) is undone with
+        # normalize=0 — these clips don't overlap in time, so there's
+        # nothing to actually blend.
+        filter_parts = []
+        mix_inputs = []
+        for index, segment in enumerate(segments):
+            delay_ms = max(0, int(round(segment["start"] * 1000)))
+            filter_parts.append(f"[{index}:a]adelay={delay_ms}|{delay_ms}[a{index}]")
+            mix_inputs.append(f"[a{index}]")
+        filter_complex = ";".join(filter_parts)
+        filter_complex += f";{''.join(mix_inputs)}amix=inputs={len(segments)}:duration=longest:normalize=0[out]"
+
+        cmd = ["ffmpeg", "-y"]
+        for clip_path in clip_paths:
+            cmd += ["-i", clip_path]
+        cmd += ["-filter_complex", filter_complex, "-map", "[out]", filepath]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=True)
+        return filepath
+    finally:
+        for clip_path in clip_paths:
+            if os.path.exists(clip_path):
+                os.remove(clip_path)
+
+
+def pad_audio_to_duration(input_path: str, target_duration: float, output_path: str) -> None:
+    """Pad (or trim) an audio file with trailing silence so its duration
+    exactly matches target_duration. Used to bring a dub track that ends
+    before the source video does up to the video's own length, so Cloud
+    Transcoder's EditAtom can be trimmed to the video's full duration
+    instead of truncating the video down to match a shorter dub track."""
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", input_path,
+            "-af", "apad", "-t", str(target_duration),
+            output_path,
+        ],
+        capture_output=True, text=True, timeout=120, check=True,
+    )
+
+
+def _estimate_speech_duration(text: str) -> float:
+    """Rough estimate of how long Cloud TTS takes to speak a line, so a
+    subtitle cue's length tracks approximately how long its dub audio
+    actually plays instead of always spanning the (possibly much longer)
+    gap until the next line's timestamp — the previous behavior could leave
+    a caption visible well after its corresponding speech had ended."""
+    chars_per_second = 16.0  # conservative average speaking rate at the 1.05x TTS speed used here
+    return max(1.2, len(text) / chars_per_second)
+
+
+def generate_srt_file(title: str, language: str, segments: list, video_duration: Optional[float] = None) -> str:
+    """Writes a standardized .srt subtitle track, one cue per dialogue
+    segment, timed at that segment's own start and sized to roughly how
+    long that line takes to speak — capped so it never overlaps into the
+    next segment's start, or past the video's end for the last one."""
     safe_title = re.sub(r'[^a-zA-Z0-9_]', '_', title.lower())
     filename = f"{safe_title}_{language.lower()}.srt"
     filepath = os.path.join(OUTPUT_DIR, "subtitles", filename)
 
-    srt_content = f"""1
-00:00:01,000 --> 00:00:04,500
-[{language.upper()} DUB] {text}
+    cues = []
+    for index, segment in enumerate(segments):
+        start = segment["start"]
+        end = start + _estimate_speech_duration(segment["text"])
+        if index + 1 < len(segments):
+            end = min(end, segments[index + 1]["start"])
+        elif video_duration is not None:
+            end = min(end, video_duration)
+        end = max(end, start + 1.0)  # never a zero/negative-length cue
+        cues.append(
+            f"{index + 1}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{segment['text']}\n"
+        )
 
-2
-00:00:05,000 --> 00:00:08,200
-[Auto-Synced by SlateParallel Concurrency Engine]
-"""
     with open(filepath, "w", encoding="utf-8") as f:
-        f.write(srt_content)
+        f.write("\n".join(cues))
     return filepath
 
 def crop_and_burn_subtitles(

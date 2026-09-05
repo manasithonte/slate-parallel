@@ -3,6 +3,7 @@ import {
   Play,
   Loader2,
   Square,
+  Upload,
   Zap,
   Film,
   Download,
@@ -90,6 +91,38 @@ export default function App() {
   const [selectedDubLanguages, setSelectedDubLanguages] = useState([]);
   const [selectedSubtitleLanguages, setSelectedSubtitleLanguages] = useState([]);
   const [selectedPlatforms, setSelectedPlatforms] = useState([]);
+
+  // Video file upload — an alternative to pasting a URL. Uploading
+  // immediately POSTs to /api/v1/upload-video and, on success, fills
+  // formData.video_url with whatever the backend hands back (a gs:// URI
+  // when GCS is configured, a local path otherwise) exactly as if the user
+  // had typed that value into the URL field themselves.
+  const [uploadState, setUploadState] = useState({ status: 'idle', fileName: null, error: null });
+  const fileInputRef = useRef(null);
+
+  const handleFileUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadState({ status: 'uploading', fileName: file.name, error: null });
+
+    const body = new FormData();
+    body.append('file', file);
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/v1/upload-video`, { method: 'POST', body });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new Error(detail?.detail || `HTTP error ${res.status}`);
+      }
+      const data = await res.json();
+      setFormData(prev => ({ ...prev, video_url: data.video_url }));
+      setUploadState({ status: 'success', fileName: file.name, error: null });
+    } catch (err) {
+      setUploadState({ status: 'error', fileName: file.name, error: err.message });
+    } finally {
+      e.target.value = '';
+    }
+  };
 
   // Per-platform choice of which previously-selected dub/subtitle language to
   // actually bake into that platform's final render. Only holds explicit user
@@ -419,22 +452,54 @@ export default function App() {
                     className="w-full px-3.5 py-2.5 bg-white border border-stone-300 rounded-xl text-sm focus:border-orange-500 focus:ring-2 focus:ring-orange-100 outline-none text-stone-900 placeholder:text-stone-400 resize-none transition"
                   />
                   <p className="text-[10px] text-stone-400 mt-1">
-                    Optional — leave blank to auto-transcribe the video instead. Whatever text ends up here becomes the dubbed audio and subtitles.
+                    Optional — leave blank to auto-transcribe the video instead. Whatever text ends up here becomes the dubbed audio and subtitles. Prefix a line with a timestamp (e.g. "[00:05] Line one") to control exactly when each line starts — otherwise every line is treated as one untimed block.
                   </p>
                 </div>
 
                 <div>
                   <label className="block text-xs font-medium text-stone-500 mb-1">Source Video Asset URL</label>
-                  <input
-                    type="url"
-                    value={formData.video_url}
-                    onChange={(e) => setFormData({ ...formData, video_url: e.target.value })}
-                    placeholder="e.g. https://vjs.zencdn.net/v/oceans.mp4"
-                    required
-                    className="w-full px-3.5 py-2.5 bg-white border border-stone-300 rounded-xl text-sm focus:border-orange-500 focus:ring-2 focus:ring-orange-100 outline-none text-stone-900 placeholder:text-stone-400 transition"
-                  />
+                  <div className="flex gap-2">
+                    <input
+                      type="url"
+                      value={formData.video_url}
+                      onChange={(e) => setFormData({ ...formData, video_url: e.target.value })}
+                      placeholder="e.g. https://vjs.zencdn.net/v/oceans.mp4"
+                      required
+                      className="flex-1 min-w-0 px-3.5 py-2.5 bg-white border border-stone-300 rounded-xl text-sm focus:border-orange-500 focus:ring-2 focus:ring-orange-100 outline-none text-stone-900 placeholder:text-stone-400 transition"
+                    />
+                    <input
+                      type="file"
+                      accept="video/*"
+                      ref={fileInputRef}
+                      onChange={handleFileUpload}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={uploadState.status === 'uploading'}
+                      title="Upload a video file instead of pasting a URL"
+                      className="shrink-0 flex items-center gap-1.5 px-3 py-2.5 bg-stone-100 hover:bg-stone-200 border border-stone-300 rounded-xl text-xs font-semibold text-stone-600 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {uploadState.status === 'uploading' ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Upload className="w-4 h-4" />
+                      )}
+                      <span>Upload</span>
+                    </button>
+                  </div>
+                  {uploadState.status === 'uploading' && (
+                    <p className="text-[10px] text-stone-400 mt-1">Uploading {uploadState.fileName}...</p>
+                  )}
+                  {uploadState.status === 'success' && (
+                    <p className="text-[10px] text-emerald-600 mt-1">✓ Uploaded {uploadState.fileName}</p>
+                  )}
+                  {uploadState.status === 'error' && (
+                    <p className="text-[10px] text-rose-600 mt-1">Upload failed: {uploadState.error}</p>
+                  )}
                   <p className="text-[10px] text-stone-400 mt-1">
-                    Supports direct video file links (.mp4, etc.) and gs:// Cloud Storage paths. YouTube links are not supported — YouTube blocks automated downloads from cloud servers.
+                    Paste a direct video file link (.mp4, etc.) or a gs:// Cloud Storage path, or upload a file directly. YouTube links are not supported — YouTube blocks automated downloads from cloud servers.
                   </p>
                 </div>
               </div>

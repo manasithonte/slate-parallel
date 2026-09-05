@@ -1,18 +1,22 @@
 # src/workers.py
 import os
 import asyncio
+import json
 import time
 import tempfile
+import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
+from src import gcs_engine
 from src.schemas import DepartmentOutput
 from src.media_engine import (
+    assemble_dubbed_track,
     download_youtube_video,
     generate_crop_ffmpeg_command,
-    generate_dubbed_audio_file,
     generate_srt_file,
     is_youtube_url,
+    parse_script_segments,
 )
 
 load_dotenv()
@@ -37,60 +41,105 @@ parallel_client = (
     else None
 )
 
-def _transcribe_video_sync(client, video_url: str) -> str:
-    """Upload an HTTP(S) video to Gemini and return its spoken dialogue."""
+def _transcribe_video_sync(client, video_url: str) -> list:
+    """Upload a video to Gemini and return its spoken dialogue as timed
+    segments — [{"start": seconds, "text": ..., "gender": ...}, ...] — rather
+    than one flat string, so subtitles and dub audio can be placed at the
+    moments the dialogue actually occurs, and dubbed in a voice matching
+    who's actually speaking, instead of a fixed offset and a single
+    always-neutral voice."""
     prompt = (
         "Listen carefully to the audio and inspect dialogue in this video. "
-        "If there is spoken dialogue, transcribe the exact spoken words. "
-        "If there is no spoken dialogue or only music/silence, return exactly "
-        "NO_SPEECH_DETECTED."
+        "Return a JSON array of objects, each with three fields: \"start_seconds\" "
+        "(a number — the time in seconds from the start of the video when that "
+        "line of dialogue begins), \"text\" (the exact spoken words for that "
+        "line), and \"gender\" (your best judgment of that speaker's voice as "
+        "\"male\", \"female\", or \"neutral\" if you can't tell). Break the "
+        "dialogue into natural segments (sentences or short phrases), each with "
+        "its own accurate start time and speaker gender — a segment where the "
+        "speaker changes should be its own entry even if adjacent in time. If "
+        "there is no spoken dialogue, or only music/silence, return exactly: []"
     )
     uploaded_file = None
     temporary_path = None
+    owns_temporary_path = False
     try:
+        # Gemini's Files API (the plain API-key client used here, as opposed
+        # to Vertex AI's SDK) can't reference a gs:// object directly —
+        # confirmed live: "Referencing Google Cloud Storage files directly
+        # is not supported." Every source type is normalized to a local
+        # temp file, then uploaded via client.files.upload the same way.
         if video_url.startswith("gs://"):
-            video_part = types.Part.from_uri(file_uri=video_url, mime_type="video/mp4")
+            parsed = urllib.parse.urlparse(video_url)
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temporary_file:
+                temporary_path = temporary_file.name
+            owns_temporary_path = True
+            gcs_engine._get_client().bucket(parsed.netloc).blob(
+                parsed.path.lstrip("/")
+            ).download_to_filename(temporary_path)
+        elif is_youtube_url(video_url):
+            # YouTube pages aren't a fetchable video stream — yt-dlp
+            # resolves the actual (time-limited, IP-locked) media and
+            # downloads it, muxing separate video/audio tracks if needed.
+            temporary_path = download_youtube_video(video_url)
+            owns_temporary_path = True
+        elif video_url.startswith(("http://", "https://")):
+            request = urllib.request.Request(video_url, headers={"User-Agent": "SlateParallel/1.0"})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                content_length = int(response.headers.get("Content-Length", "0"))
+                max_bytes = 100 * 1024 * 1024
+                if content_length > max_bytes:
+                    raise ValueError("Video exceeds the 100 MB upload limit")
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temporary_file:
+                    temporary_path = temporary_file.name
+                    owns_temporary_path = True
+                    total_bytes = 0
+                    while chunk := response.read(1024 * 1024):
+                        total_bytes += len(chunk)
+                        if total_bytes > max_bytes:
+                            raise ValueError("Video exceeds the 100 MB upload limit")
+                        temporary_file.write(chunk)
+        elif os.path.exists(video_url):
+            # An uploaded video already sitting on local disk (see
+            # /api/v1/upload-video's no-GCS fallback) — not ours to delete,
+            # later pipeline stages (final render) still need this exact file.
+            temporary_path = video_url
         else:
-            if is_youtube_url(video_url):
-                # YouTube pages aren't a fetchable video stream — yt-dlp
-                # resolves the actual (time-limited, IP-locked) media and
-                # downloads it, muxing separate video/audio tracks if needed.
-                temporary_path = download_youtube_video(video_url)
-            elif video_url.startswith(("http://", "https://")):
-                request = urllib.request.Request(video_url, headers={"User-Agent": "SlateParallel/1.0"})
-                with urllib.request.urlopen(request, timeout=60) as response:
-                    content_length = int(response.headers.get("Content-Length", "0"))
-                    max_bytes = 100 * 1024 * 1024
-                    if content_length > max_bytes:
-                        raise ValueError("Video exceeds the 100 MB upload limit")
-                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temporary_file:
-                        temporary_path = temporary_file.name
-                        total_bytes = 0
-                        while chunk := response.read(1024 * 1024):
-                            total_bytes += len(chunk)
-                            if total_bytes > max_bytes:
-                                raise ValueError("Video exceeds the 100 MB upload limit")
-                            temporary_file.write(chunk)
-            else:
-                raise ValueError("Video URL must use https://, http://, or gs://")
+            raise ValueError("Video URL must use https://, http://, gs://, or an existing local path")
 
-            uploaded_file = client.files.upload(file=temporary_path)
-            deadline = time.monotonic() + 120
-            while not uploaded_file.state or uploaded_file.state.name != "ACTIVE":
-                state_name = uploaded_file.state.name if uploaded_file.state else "PROCESSING"
-                if time.monotonic() >= deadline or state_name == "FAILED":
-                    raise RuntimeError("Gemini could not process the uploaded video")
-                time.sleep(2)
-                uploaded_file = client.files.get(name=uploaded_file.name)
-            video_part = uploaded_file
+        uploaded_file = client.files.upload(file=temporary_path)
+        deadline = time.monotonic() + 120
+        while not uploaded_file.state or uploaded_file.state.name != "ACTIVE":
+            state_name = uploaded_file.state.name if uploaded_file.state else "PROCESSING"
+            if time.monotonic() >= deadline or state_name == "FAILED":
+                raise RuntimeError("Gemini could not process the uploaded video")
+            time.sleep(2)
+            uploaded_file = client.files.get(name=uploaded_file.name)
+        video_part = uploaded_file
 
         response = client.models.generate_content(
             model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
             contents=[video_part, prompt],
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        return (response.text or "").strip()
+        raw = (response.text or "").strip()
+        parsed = json.loads(raw) if raw else []
+        segments = []
+        for item in parsed:
+            try:
+                start = float(item["start_seconds"])
+                text = str(item["text"]).strip()
+            except (KeyError, TypeError, ValueError):
+                continue
+            if text:
+                gender = str(item.get("gender", "")).strip().lower()
+                if gender not in ("male", "female"):
+                    gender = "neutral"
+                segments.append({"start": start, "text": text, "gender": gender})
+        segments.sort(key=lambda s: s["start"])
+        return segments
     finally:
-        if temporary_path and os.path.exists(temporary_path):
+        if owns_temporary_path and temporary_path and os.path.exists(temporary_path):
             os.remove(temporary_path)
         if uploaded_file:
             try:
@@ -105,9 +154,13 @@ async def run_script_subtitle_worker(
     target_languages: List[str],
     title: str,
 ) -> DepartmentOutput:
-    """Inspect source-video dialogue, then translate and export localized subtitles."""
+    """Inspect source-video dialogue, then translate and export localized
+    subtitles — timing (segment start times) flows through from whichever
+    source produced the dialogue (master script "[MM:SS]" markers, or
+    Gemini's timestamped transcription) all the way to the .srt cues and,
+    in sound_stage_dubbing_worker, the placement of each dub audio line."""
     start_time = time.time()
-    detected_dialogue = ""
+    segments = []
     source_used = "unavailable"
     transcription_error = None
     api_key = os.getenv("GEMINI_API_KEY")
@@ -116,14 +169,13 @@ async def run_script_subtitle_worker(
     # server-side processing) is the slowest step in the pipeline, and is
     # only worth paying for when there's no script to fall back to.
     if script_text.strip():
-        detected_dialogue = script_text.strip()
+        segments = parse_script_segments(script_text)
         source_used = "master_script"
     elif genai and types and api_key:
         try:
             client = genai.Client(api_key=api_key)
-            transcription = await asyncio.to_thread(_transcribe_video_sync, client, video_url)
-            if transcription and "NO_SPEECH_DETECTED" not in transcription:
-                detected_dialogue = transcription
+            segments = await asyncio.to_thread(_transcribe_video_sync, client, video_url)
+            if segments:
                 source_used = "video_transcription"
             else:
                 transcription_error = "No speech detected in video and no master script was provided."
@@ -133,29 +185,51 @@ async def run_script_subtitle_worker(
     else:
         transcription_error = "Gemini is not configured and no master script was provided; nothing to transcribe or translate."
 
+    detected_dialogue = "\n".join(segment["text"] for segment in segments)
     client = genai.Client(api_key=api_key) if genai and api_key else None
 
-    async def _translate_one(language: str) -> Tuple[str, str, Optional[str]]:
-        """Returns (language, translated_text, error_or_None)."""
-        if not (client and detected_dialogue):
-            return language, "", None
+    async def _translate_one(language: str) -> Tuple[str, list, Optional[str]]:
+        """Returns (language, translated_segments, error_or_None). Segments
+        keep their original start times — only the text changes."""
+        if not (client and segments):
+            return language, [], None
         try:
             translation_prompt = (
-                f"Translate the following movie dialogue into natural, idiomatic {language}. "
-                f"Return only the translated text:\n\n{detected_dialogue}"
+                f"Translate each of the following movie dialogue lines into natural, "
+                f"idiomatic {language}. Return a JSON array of strings, in the exact "
+                f"same order, with exactly {len(segments)} items — one translated "
+                f"line per input line, no extra commentary:\n\n"
+                f"{json.dumps([segment['text'] for segment in segments])}"
             )
             response = await asyncio.to_thread(
                 client.models.generate_content,
                 model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
                 contents=translation_prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
-            return language, (response.text or "").strip() or detected_dialogue, None
+            raw = (response.text or "").strip()
+            translated_texts = json.loads(raw) if raw else []
+            if not isinstance(translated_texts, list) or len(translated_texts) != len(segments):
+                raise ValueError(
+                    f"Expected {len(segments)} translated lines, got "
+                    f"{len(translated_texts) if isinstance(translated_texts, list) else type(translated_texts).__name__}"
+                )
+            translated_segments = [
+                {
+                    "start": segment["start"],
+                    "text": str(text).strip() or segment["text"],
+                    "gender": segment.get("gender", "neutral"),
+                }
+                for segment, text in zip(segments, translated_texts)
+            ]
+            return language, translated_segments, None
         except Exception as exc:
             # Same graceful degradation as a successful-but-empty response
             # above — without this, a transient Gemini error (rate limit,
-            # safety-filter block, etc.) leaves this language with no
-            # dialogue at all instead of falling back to the source text.
-            return language, detected_dialogue, str(exc)
+            # safety-filter block, malformed JSON, etc.) leaves this
+            # language with no dialogue at all instead of falling back to
+            # the (still correctly-timed) source-language segments.
+            return language, segments, str(exc)
 
     # One Gemini call per language, independent of each other — run
     # concurrently instead of awaiting them one at a time.
@@ -164,14 +238,16 @@ async def run_script_subtitle_worker(
     )
 
     localized_dialogues = {}
+    localized_segments = {}
     subtitle_files = {}
-    for language, translated_text, error in translation_results:
+    for language, translated_segments, error in translation_results:
         if error:
             print(f"[Worker 01 Translation Fallback ({language})]: {error}")
             transcription_error = transcription_error or error
-        localized_dialogues[language] = translated_text
-        if translated_text:
-            subtitle_files[language] = generate_srt_file(title, language, translated_text)
+        localized_segments[language] = translated_segments
+        localized_dialogues[language] = "\n".join(segment["text"] for segment in translated_segments)
+        if translated_segments:
+            subtitle_files[language] = generate_srt_file(title, language, translated_segments)
 
     return DepartmentOutput(
         worker_id="worker_01",
@@ -181,6 +257,7 @@ async def run_script_subtitle_worker(
             "transcription_source": source_used,
             "active_dialogue": detected_dialogue,
             "localized_dialogues": localized_dialogues,
+            "localized_segments": localized_segments,
             "subtitle_files": subtitle_files,
             "transcription_error": transcription_error,
         },
@@ -193,26 +270,29 @@ async def script_and_subtitle_worker(script_text: str, languages: List[str]) -> 
     return await run_script_subtitle_worker("", script_text, languages, "Untitled Project")
 
 async def sound_stage_dubbing_worker(
-    title: str, localized_dialogues: Dict[str, str]
+    title: str, localized_segments: Dict[str, list]
 ) -> DepartmentOutput:
-    """Worker 2: Generate downloadable localized MP3 dubbed-audio tracks."""
+    """Worker 2: Generate downloadable localized MP3 dubbed-audio tracks,
+    each dialogue line placed at its own timestamp (assemble_dubbed_track)
+    instead of fused into one clip starting at 0s — the latter is why
+    dubbed audio used to drift out of sync with longer videos."""
     start_time = time.time()
 
-    async def _synthesize_one(language: str, dialogue: str) -> Tuple[str, Optional[str], Optional[str]]:
+    async def _synthesize_one(language: str, segments: list) -> Tuple[str, Optional[str], Optional[str]]:
         """Returns (language, audio_path_or_None, error_or_None)."""
-        if not dialogue:
+        if not segments:
             return language, None, "No localized dialogue was available for synthesis."
         try:
-            path = await asyncio.to_thread(generate_dubbed_audio_file, title, language, dialogue)
+            path = await asyncio.to_thread(assemble_dubbed_track, title, language, segments)
             return language, path, None
         except Exception as exc:
             print(f"[Worker 02 Dubbing Fallback ({language})]: {exc}")
             return language, None, str(exc)
 
-    # One Cloud TTS call per language — independent, so run concurrently
-    # instead of synthesizing one voice track at a time.
+    # One dub track per language, independent — run concurrently instead
+    # of synthesizing one voice track at a time.
     synthesis_results = await asyncio.gather(
-        *(_synthesize_one(language, dialogue) for language, dialogue in localized_dialogues.items())
+        *(_synthesize_one(language, segments) for language, segments in localized_segments.items())
     )
 
     audio_tracks = {}

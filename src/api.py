@@ -1,10 +1,12 @@
 # src/api.py
 import time
 import asyncio
+import uuid
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from src import gcs_engine
 from src.schemas import MediaJobRequest, RenderJob, RenderJobRequest
 from src.workers import (
     run_script_subtitle_worker,
@@ -23,6 +25,11 @@ app = FastAPI(
 
 OUTPUT_AUDIO_DIR = Path("outputs") / "audio"
 OUTPUT_SUBTITLE_DIR = Path("outputs") / "subtitles"
+OUTPUT_UPLOADS_DIR = Path("outputs") / "uploads"
+OUTPUT_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 
 # Enable CORS for frontend dashboard calls
 app.add_middleware(
@@ -60,6 +67,47 @@ async def download_subtitle(filename: str):
     if not subtitle_path.is_file():
         raise HTTPException(status_code=404, detail="Subtitle file not found")
     return FileResponse(subtitle_path, media_type="application/x-subrip", filename=safe_filename)
+
+
+@app.post("/api/v1/upload-video")
+async def upload_video(file: UploadFile = File(...)):
+    """Accept a video file upload and return a video_url usable directly by
+    /api/v1/process-media and /api/v1/assemble-final. Staged to GCS when
+    configured — a gs:// URI works correctly no matter which Cloud Run
+    instance later handles those requests, the same reasoning behind the
+    render-job Firestore persistence. Falls back to a local path otherwise,
+    which only works for single-process local dev."""
+    original_name = Path(file.filename or "upload.mp4").name
+    extension = Path(original_name).suffix.lower()
+    if extension not in ALLOWED_VIDEO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported video file type: {extension or 'unknown'}")
+
+    temp_path = OUTPUT_UPLOADS_DIR / f"{uuid.uuid4().hex}{extension}"
+    total_bytes = 0
+    try:
+        with open(temp_path, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=400, detail="Video exceeds the 200 MB upload limit")
+                out.write(chunk)
+    except HTTPException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        temp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Upload failed: {exc}")
+
+    if gcs_engine.is_gcs_configured():
+        try:
+            video_url = await asyncio.to_thread(
+                gcs_engine.upload_to_gcs, str(temp_path), f"uploads/{temp_path.name}"
+            )
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return {"video_url": video_url}
+
+    return {"video_url": str(temp_path)}
 
 @app.post("/api/v1/assemble-final", response_model=RenderJob)
 async def assemble_final_release(request: RenderJobRequest):
@@ -115,14 +163,14 @@ async def process_media_job(job_request: MediaJobRequest):
         )
         # Worker 02 only synthesizes audio for languages actually requested
         # for dubbing, even though worker_01 translated a possibly larger set.
-        dubbing_dialogues = {
-            lang: text
-            for lang, text in worker_01.data.get("localized_dialogues", {}).items()
+        dubbing_segments = {
+            lang: segments
+            for lang, segments in worker_01.data.get("localized_segments", {}).items()
             if lang in job_request.dubbing_languages
         }
         worker_02 = await sound_stage_dubbing_worker(
             job_request.title,
-            dubbing_dialogues,
+            dubbing_segments,
         )
         worker_results = [worker_01, worker_02, worker_03, worker_04]
         
