@@ -131,6 +131,26 @@ def _crop_pixels_for_platform(platform: str, width: int, height: int) -> "transc
     return transcoder_v1.types.PreprocessingConfig.Crop()
 
 
+def _ensure_local_file(path_or_uri: str, suffix: str) -> Tuple[str, bool]:
+    """Resolve a subtitle/audio reference to a local path ffmpeg/ffprobe can
+    read. worker_01/worker_02 now upload their outputs straight to GCS when
+    it's configured (so any Cloud Run instance can reach them, not just the
+    one that generated them) — this downloads that gs:// object to a local
+    temp file on demand. A plain local path (GCS not configured, single-
+    process dev) passes through unchanged. Returns (local_path, owns_it) —
+    owns_it is True only for a freshly-downloaded temp file the caller must
+    delete; False for a path someone else is responsible for."""
+    if path_or_uri.startswith("gs://"):
+        parsed = urllib.parse.urlparse(path_or_uri)
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            local_path = temp_file.name
+        gcs_engine._get_client().bucket(parsed.netloc).blob(
+            parsed.path.lstrip("/")
+        ).download_to_filename(local_path)
+        return local_path, True
+    return path_or_uri, False
+
+
 def _probe_video_dimensions(local_path: str) -> Tuple[int, int, float]:
     """Read source width/height/duration via ffprobe. Width/height feed
     Transcoder's own crop for platforms with no subtitles to burn (see
@@ -397,9 +417,20 @@ async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
 
     async def _stage_platform_video(platform: str, rendition) -> None:
         subtitle_language = rendition.subtitle_language
-        srt_path = request.subtitle_files.get(subtitle_language) if subtitle_language else None
-        if srt_path and not os.path.exists(srt_path):
-            srt_path = None
+        srt_ref = request.subtitle_files.get(subtitle_language) if subtitle_language else None
+        srt_path = None
+        if srt_ref:
+            try:
+                local_srt_path, owns_srt = await asyncio.to_thread(_ensure_local_file, srt_ref, ".srt")
+                if owns_srt:
+                    rendered_local_paths.append(local_srt_path)
+                if os.path.exists(local_srt_path):
+                    srt_path = local_srt_path
+            except Exception:
+                # Same graceful degradation as before for a stale/missing
+                # local path: render without subtitles for this platform
+                # rather than failing the whole job over one missing file.
+                srt_path = None
 
         if not srt_path:
             # No subtitles to burn — skip the local ffmpeg crop/scale pass
@@ -426,11 +457,14 @@ async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
         )
 
     async def _stage_dub_audio(dub_language: str) -> None:
-        audio_path = request.dubbed_tracks.get(dub_language)
-        if not audio_path:
+        audio_ref = request.dubbed_tracks.get(dub_language)
+        if not audio_ref:
             dub_audio_uris[dub_language] = None
             dub_audio_durations[dub_language] = None
             return
+        audio_path, owns_audio_path = await asyncio.to_thread(_ensure_local_file, audio_ref, ".mp3")
+        if owns_audio_path:
+            rendered_local_paths.append(audio_path)
         audio_duration = await asyncio.to_thread(_probe_audio_duration, audio_path)
         if audio_duration < video_duration:
             # A dub track shorter than the source video used to force the

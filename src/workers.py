@@ -41,6 +41,25 @@ parallel_client = (
     else None
 )
 
+
+def _publish_output_file(local_path: str, dest_blob_name: str) -> str:
+    """Return a reference to a generated subtitle/dub-audio file that any
+    Cloud Run instance can resolve later — a gs:// URI when GCS is
+    configured, since these files otherwise only exist on whichever
+    instance's local disk generated them, and the later /api/v1/assemble-
+    final request has no guarantee of landing on that same instance
+    (confirmed live: an "ffprobe ... exit status 1" on exactly this kind of
+    now-missing local file). Falls back to the local path unchanged when GCS
+    isn't configured — the local file is left in place either way, since the
+    existing /api/v1/downloads/* endpoints still serve directly from it."""
+    if gcs_engine.is_gcs_configured():
+        try:
+            return gcs_engine.upload_to_gcs(local_path, dest_blob_name)
+        except Exception as exc:
+            print(f"[Worker Output Staging] Failed to upload {local_path} to GCS: {exc}")
+    return local_path
+
+
 def _transcribe_video_sync(client, video_url: str) -> list:
     """Upload a video to Gemini and return its spoken dialogue as timed
     segments — [{"start": seconds, "text": ..., "gender": ...}, ...] — rather
@@ -247,7 +266,10 @@ async def run_script_subtitle_worker(
         localized_segments[language] = translated_segments
         localized_dialogues[language] = "\n".join(segment["text"] for segment in translated_segments)
         if translated_segments:
-            subtitle_files[language] = generate_srt_file(title, language, translated_segments)
+            srt_path = generate_srt_file(title, language, translated_segments)
+            subtitle_files[language] = _publish_output_file(
+                srt_path, f"worker_outputs/subtitles/{os.path.basename(srt_path)}"
+            )
 
     return DepartmentOutput(
         worker_id="worker_01",
@@ -284,7 +306,10 @@ async def sound_stage_dubbing_worker(
             return language, None, "No localized dialogue was available for synthesis."
         try:
             path = await asyncio.to_thread(assemble_dubbed_track, title, language, segments)
-            return language, path, None
+            published_path = _publish_output_file(
+                path, f"worker_outputs/audio/{os.path.basename(path)}"
+            )
+            return language, published_path, None
         except Exception as exc:
             print(f"[Worker 02 Dubbing Fallback ({language})]: {exc}")
             return language, None, str(exc)
