@@ -902,7 +902,7 @@ export default function App() {
 
                   <button
                     onClick={handleAssembleFinal}
-                    disabled={renderSubmitting || !workerTwoData}
+                    disabled={renderSubmitting || !workerTwoData || selectedPlatforms.length === 0}
                     className="w-full flex items-center justify-center gap-2 px-3.5 py-2 bg-orange-600 hover:bg-orange-700 rounded-lg text-xs font-semibold text-white shadow-md shadow-orange-600/20 transition disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {renderSubmitting ? (
@@ -912,6 +912,11 @@ export default function App() {
                     )}
                     <span>Render Final Video</span>
                   </button>
+                  {selectedPlatforms.length === 0 && (
+                    <p className="text-[10px] text-rose-600 text-center">
+                      Select at least one target platform above before rendering.
+                    </p>
+                  )}
 
                   {renderJob && (() => {
                     const isActive = RENDER_ACTIVE_STATUSES.has(renderJob.overall_status);

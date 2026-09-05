@@ -119,6 +119,12 @@ async def assemble_final_release(request: RenderJobRequest):
     for completion. Falls back to a NOT_CONFIGURED status if GCS/Transcoder
     aren't set up, rather than failing the request.
     """
+    if not request.platform_renditions:
+        # submit_render_job builds one RenderOutput per platform — with none
+        # given, that's an empty outputs list, which _run_render_pipeline
+        # then marks FAILED with no per-output error to explain why (there's
+        # nowhere to attach one). Reject it clearly here instead.
+        raise HTTPException(status_code=400, detail="No platforms selected — pick at least one target platform before rendering.")
     try:
         return await submit_render_job(request)
     except Exception as e:
