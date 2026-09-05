@@ -35,16 +35,28 @@ try:
 except ImportError:
     transcoder_v1 = None
 
+try:
+    from google.cloud import firestore
+except ImportError:
+    firestore = None
+
 load_dotenv()
 
 TRANSCODER_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 TRANSCODER_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
 POLL_INTERVAL_SECONDS = 10
 MAX_POLL_ATTEMPTS = 180  # ~30 minutes per job
+RENDER_JOBS_COLLECTION = "render_jobs"
 
+# Per-instance fast path — still authoritative for whichever Cloud Run
+# instance is actually running a given job's background task, and the only
+# store available at all in local dev without Firestore configured. Mirrored
+# to Firestore below because Cloud Run gives no guarantee that a later
+# GET /render-status poll lands on this same instance.
 RENDER_JOBS: Dict[str, RenderJob] = {}
 
 _transcoder_client = None
+_firestore_client = None
 
 
 def is_transcoder_configured() -> bool:
@@ -56,6 +68,51 @@ def _get_client():
     if _transcoder_client is None:
         _transcoder_client = transcoder_v1.TranscoderServiceClient()
     return _transcoder_client
+
+
+def _get_firestore_client():
+    global _firestore_client
+    if _firestore_client is None and firestore and TRANSCODER_PROJECT:
+        _firestore_client = firestore.Client(project=TRANSCODER_PROJECT)
+    return _firestore_client
+
+
+def _save_render_job_sync(render_job: RenderJob) -> None:
+    client = _get_firestore_client()
+    if not client:
+        return
+    client.collection(RENDER_JOBS_COLLECTION).document(render_job.render_job_id).set(
+        render_job.model_dump(mode="json")
+    )
+
+
+async def _persist(render_job: RenderJob) -> None:
+    """Mirror the current render job state to Firestore. Best-effort: a
+    persistence failure is logged, not fatal — the in-memory copy in the
+    instance actually doing the work is still correct for it, and status
+    polls from that same instance keep working regardless."""
+    try:
+        await asyncio.to_thread(_save_render_job_sync, render_job)
+    except Exception as exc:
+        print(f"[Render Job Persistence] Failed to save {render_job.render_job_id}: {exc}")
+
+
+async def get_render_job(render_job_id: str) -> Optional[RenderJob]:
+    """Look up a render job for a status poll — same-instance memory first
+    (fast path; the only option in local dev with no Firestore configured),
+    falling back to Firestore for a job whose background task is running on
+    a different Cloud Run instance than the one serving this request."""
+    if render_job_id in RENDER_JOBS:
+        return RENDER_JOBS[render_job_id]
+    client = _get_firestore_client()
+    if not client:
+        return None
+    doc = await asyncio.to_thread(
+        lambda: client.collection(RENDER_JOBS_COLLECTION).document(render_job_id).get()
+    )
+    if doc.exists:
+        return RenderJob(**doc.to_dict())
+    return None
 
 
 def _crop_pixels_for_platform(platform: str, width: int, height: int) -> "transcoder_v1.types.PreprocessingConfig.Crop":
@@ -257,7 +314,8 @@ async def _submit_and_poll(
     audio_gcs_uri: Optional[str], audio_duration: Optional[float],
     raw_video_dims: Optional[Tuple[int, int]] = None,
 ):
-    output = RENDER_JOBS[render_job_id].outputs[index]
+    render_job = RENDER_JOBS[render_job_id]
+    output = render_job.outputs[index]
     try:
         job, output_filename = _build_job(
             render_job_id, platform, dub_language, subtitle_language,
@@ -269,6 +327,7 @@ async def _submit_and_poll(
         created = await asyncio.to_thread(client.create_job, parent=parent, job=job)
         output.transcoder_job_name = created.name
         output.status = RenderJobStatus.SUBMITTED
+        await _persist(render_job)
 
         for _ in range(MAX_POLL_ATTEMPTS):
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -284,17 +343,21 @@ async def _submit_and_poll(
                     )
                 except Exception as exc:
                     output.error = f"Rendered but signed URL failed: {exc}"
+                await _persist(render_job)
                 return
             if state == "FAILED":
                 output.status = RenderJobStatus.FAILED
                 output.error = polled.error.message if polled.error else "Transcoder job failed"
+                await _persist(render_job)
                 return
 
         output.status = RenderJobStatus.FAILED
         output.error = f"Timed out after {MAX_POLL_ATTEMPTS * POLL_INTERVAL_SECONDS}s waiting on Transcoder"
+        await _persist(render_job)
     except Exception as exc:
         output.status = RenderJobStatus.FAILED
         output.error = str(exc)
+        await _persist(render_job)
 
 
 async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
@@ -307,6 +370,7 @@ async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
             output.status = RenderJobStatus.FAILED
             output.error = f"Source video staging failed: {exc}"
         render_job.overall_status = RenderJobStatus.FAILED
+        await _persist(render_job)
         return
 
     platform_video_uris: Dict[str, str] = {}
@@ -390,6 +454,7 @@ async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
             output.status = RenderJobStatus.FAILED
             output.error = f"Crop/subtitle-burn or staging failed: {exc}"
         render_job.overall_status = RenderJobStatus.FAILED
+        await _persist(render_job)
         return
     finally:
         for path in [local_source_path] + rendered_local_paths:
@@ -415,6 +480,7 @@ async def _run_render_pipeline(render_job_id: str, request: RenderJobRequest):
         render_job.overall_status = RenderJobStatus.SUCCEEDED  # partial success reflected per-output
     else:
         render_job.overall_status = RenderJobStatus.FAILED
+    await _persist(render_job)
 
 
 async def submit_render_job(request: RenderJobRequest) -> RenderJob:
@@ -444,8 +510,10 @@ async def submit_render_job(request: RenderJobRequest) -> RenderJob:
             output.status = RenderJobStatus.NOT_CONFIGURED
             output.error = message
         render_job.overall_status = RenderJobStatus.NOT_CONFIGURED
+        await _persist(render_job)
         return render_job
 
     render_job.overall_status = RenderJobStatus.SUBMITTED
+    await _persist(render_job)
     asyncio.create_task(_run_render_pipeline(render_job_id, request))
     return render_job

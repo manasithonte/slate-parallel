@@ -780,7 +780,6 @@ export default function App() {
                               muted
                               loop
                               playsInline
-                              crossOrigin="anonymous"
                               className="object-cover w-full h-full"
                             />
                           )}

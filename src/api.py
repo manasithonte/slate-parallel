@@ -13,7 +13,7 @@ from src.workers import (
     global_standards_compliance_worker
 )
 from src.orchestrator import synthesize_master_release_package
-from src.render_engine import submit_render_job, RENDER_JOBS
+from src.render_engine import submit_render_job, get_render_job
 
 app = FastAPI(
     title="slate-parallel API",
@@ -80,12 +80,9 @@ async def assemble_final_release(request: RenderJobRequest):
 @app.get("/api/v1/render-status/{render_job_id}", response_model=RenderJob)
 async def get_render_status(render_job_id: str):
     """Poll the status of a submitted final-assembly render job."""
-    job = RENDER_JOBS.get(render_job_id)
+    job = await get_render_job(render_job_id)
     if not job:
-        raise HTTPException(
-            status_code=404,
-            detail="Render job not found (it may have been submitted to a different instance)",
-        )
+        raise HTTPException(status_code=404, detail="Render job not found")
     return job
 
 

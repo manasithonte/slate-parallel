@@ -3,6 +3,7 @@ google-genai>=1.0.0
 google-cloud-texttospeech>=2.0.0
 google-cloud-storage>=2.0.0
 google-cloud-video-transcoder>=1.0.0
+google-cloud-firestore>=2.11.0
 parallel-web>=0.1.0
 python-dotenv>=1.0.0
 fastapi>=0.110.0
